@@ -60,6 +60,12 @@
         description = "Paquet ntfy-mcp à utiliser.";
       };
 
+      address = lib.mkOption {
+        type = lib.types.str;
+        default = "127.0.0.1";
+        description = "Address the MCP server listens on.";
+      };
+
       port = lib.mkOption {
         type = lib.types.port;
         default = 12120;
@@ -99,6 +105,7 @@
         serviceConfig = {
     ExecStart = lib.getExe cfg.package;
     Environment = [
+      "MCP_NTFY_ADDR=${toString cfg.address}"
       "MCP_NTFY_PORT=${toString cfg.port}"
       "NTFY_URL=${cfg.ntfyUrl}"
       "NTFY_TOPIC=${cfg.ntfyTopic}"
