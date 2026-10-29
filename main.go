@@ -2,10 +2,11 @@
 //
 // Configuration via environment variables:
 //
-//  NTFY_URL    Default ntfy server URL (default: https://ntfy.sh)
-//  NTFY_TOPIC  Default topic (default: agent)
-//  NTFY_TOKEN  Default token (default: empty)
+//  NTFY_URL      Default ntfy server URL (default: https://ntfy.sh)
+//  NTFY_TOPIC    Default topic (default: agent)
+//  NTFY_TOKEN    Default token (default: empty)
 //
+//  MCP_NTFY_ADDR MCP server listen address (default: 127.0.0.1)
 //  MCP_NTFY_PORT MCP server port (default: 12120)
 //
 // An agent can override any of these variables in an MCP request.
@@ -21,6 +22,7 @@ import (
   "io"
   "net"
   "net/http"
+  "net/url"
   "log"
   "os"
   "strconv"
@@ -50,6 +52,7 @@ type config struct {
   BaseURL string // Base URL, already normalized (no trailing slash)
   Topic   string
   Token   string
+  MCPAddr string
   MCPPort int
 }
 
@@ -65,6 +68,7 @@ func loadConfig() (config, error) {
     BaseURL: strings.TrimRight(getenv("NTFY_URL", "https://ntfy.sh"), "/"),
     Topic:   getenv("NTFY_TOPIC", "agent"),
     Token:   getenv("NTFY_TOKEN", ""),
+    MCPAddr: getenv("MCP_NTFY_ADDR", "127.0.0.1"),
     MCPPort: mcpport,
   }
 
@@ -76,6 +80,25 @@ func getenv(key, fallback string) string {
     return v
   }
   return fallback
+}
+
+// sameOrigin reports whether two raw base URLs point to the exact same
+// destination: identical scheme and host (case-insensitive, port included)
+// and identical path, with no userinfo component. Anything that fails to
+// parse, or that carries a userinfo (e.g. "https://host@evil/"), is
+// considered a different origin.
+func sameOrigin(rawA, rawB string) bool {
+  a, err := url.Parse(strings.TrimRight(rawA, "/"))
+  if err != nil || a.User != nil || a.Scheme == "" || a.Host == "" {
+    return false
+  }
+  b, err := url.Parse(strings.TrimRight(rawB, "/"))
+  if err != nil || b.User != nil || b.Scheme == "" || b.Host == "" {
+    return false
+  }
+  return strings.EqualFold(a.Scheme, b.Scheme) &&
+    strings.EqualFold(a.Host, b.Host) &&
+    a.Path == b.Path
 }
 
 // notificationArgs describes the parameters for the send_notification tool.
@@ -110,8 +133,10 @@ func (c config) publish(ctx context.Context, args notificationArgs) error {
 
   // Anti-exfiltration guard: an agent-chosen base_url is only accepted
   // when the request carries its own token. Otherwise the server's
-  // token could be sent to an arbitrary destination.
-  if args.BaseURL != "" && args.BaseURL != c.BaseURL && args.Token == "" {
+  // token could be sent to an arbitrary destination. Origins are
+  // compared as parsed URLs (scheme + host + path), never as raw
+  // strings, so look-alike spellings cannot slip through.
+  if args.BaseURL != "" && !sameOrigin(args.BaseURL, c.BaseURL) && args.Token == "" {
     log.Printf("REJECTED custom base_url %q without request token: server token must not leave to an agent-chosen URL", args.BaseURL)
     return fmt.Errorf("custom base_url requires a token in the request")
   }
@@ -188,8 +213,7 @@ func buildNotificationTool() mcp.Tool {
       mcp.Description("Title of the notification."),
     ),
     mcp.WithString("topic",
-      mcp.Required(),
-      mcp.Description("Destination topic."),
+      mcp.Description("Destination topic (defaults to the server-side configured topic)."),
     ),
     mcp.WithNumber("priority",
       mcp.Description("Priority from 1 (lowest) to 5 (highest)."),
@@ -203,12 +227,17 @@ func buildNotificationTool() mcp.Tool {
 // notificationHandler applies the arguments and publishes the notification.
 func notificationHandler(cfg config) server.ToolHandlerFunc {
   return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-    log.Printf("send_notification called with: %+v", request.GetArguments())
     args, err := parseArgs(request)
     if err != nil {
       log.Printf("ERROR: %v", err)
       return nil, err
     }
+
+    // Log the call with the token redacted: tokens must never reach the logs.
+    redacted := args
+    redacted.Token = "[redacted]"
+    log.Printf("send_notification called with: %+v", redacted)
+
     if strings.TrimSpace(args.Message) == "" {
       log.Print("ERROR: message parameter is empty")
       return nil, fmt.Errorf("message parameter cannot be empty")
@@ -242,7 +271,7 @@ func main() {
   srv.AddTool(buildNotificationTool(), notificationHandler(cfg))
 
   httpSrv := server.NewStreamableHTTPServer(srv)
-  addr := fmt.Sprintf(":%d", cfg.MCPPort)
+  addr := fmt.Sprintf("%s:%d", cfg.MCPAddr, cfg.MCPPort)
   log.Printf("server v.%s listening on %s (path /mcp)", Version, addr)
   if err := httpSrv.Start(addr); err != nil {
     log.Fatalf("fatal error: %v", err)
