@@ -92,6 +92,7 @@ services.ntfy-mcp = {
 The server supports two deployment regimes, depending on whether the `NTFY_TOKEN` environment variable is set:
 
 - **Private server**: the token stays server-side (`NTFY_TOKEN`) and agents only provide `message`, `title`, `priority` and `tags`. The agent never sees any credential and cannot choose the ntfy server URL (to prevent token exfiltration).
+  - **TODO** implement a security mecanism to prevent unauthenticated users to spam notifications.
 - **Public server**: agents provide `base_url` and `token` themselves, which allows multiplexing several ntfy backends through one MCP server.
 
 ### Logging
