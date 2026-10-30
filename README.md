@@ -1,6 +1,6 @@
 # ntfy-mcp
 
-A [Model Context Protocol (MCP)](https://github.com/modelcontextprotocol/spec) server that exposes a tool to send notifications via [ntfy](https://ntfy.sh/).
+A [Model Context Protocol (MCP)](https://github.com/modelcontextprotocol/spec) server that exposes a tool to send notifications via [ntfy](https://ntfy.sh/).  
 Its goal is to be lightweight and act as the glue for agents running in harnesses that don't give them full HTTP client capabilities.
 
 ## Overview
@@ -12,13 +12,14 @@ This server allows MCP clients (usually AI agents) to send notifications to an [
 Configure the server using environment variables:
 
 
-| Variable        | Default           | Description                              |
-| --------------- | ----------------- | ---------------------------------------- |
-| `NTFY_URL`      | `https://ntfy.sh` | Base URL of the ntfy server              |
-| `NTFY_TOPIC`    | `agent`           | Default topic for notifications          |
-| `NTFY_TOKEN`    | *empty*           | Authentication token for the ntfy server |
-| `MCP_NTFY_ADDR` | `127.0.0.1`       | Address to listen on for MCP connections |
-| `MCP_NTFY_PORT` | `12120`           | Port to listen on for MCP connections    |
+| Variable               | Default           | Description                                                |
+| ---------------------- | ----------------- | ---------------------------------------------------------- |
+| `NTFY_URL`             | `https://ntfy.sh` | Base URL of the ntfy server                                |
+| `NTFY_TOPIC`           | `agent`           | Default topic for notifications                            |
+| `NTFY_TOKEN`           | *empty*           | Authentication token for the ntfy server                   |
+| `MCP_NTFY_ADDR`        | `127.0.0.1`       | Address to listen on for MCP connections                   |
+| `MCP_NTFY_PORT`        | `12120`           | Port to listen on for MCP connections                      |
+| `MCP_NTFY_UNSAFE_LOGS` | `0`               | Log level for unsafe logging; `1` logs tokens in cleartext |
 
 
 ## Usage
@@ -95,9 +96,15 @@ The server supports two deployment regimes, depending on whether the `NTFY_TOKEN
 
 ### Logging
 
-The server logs to stderr with the `[ntfy-mcp]` prefix. Tokens are replaced with `[redacted]` in log lines, which can be an annoyance when troubleshooting connection issues.
+The server logs to stderr with the `[ntfy-mcp]` prefix. By default, tokens are replaced with `[redacted]` in log lines, which can be an annoyance when troubleshooting connection issues.
 
-- **TODO** add an `--unsafe-logs` CLI option.
+For debugging, set `MCP_NTFY_UNSAFE_LOGS=1` to log authentication tokens in cleartext.
+
+```bash
+MCP_NTFY_UNSAFE_LOGS=1 ./ntfy-mcp
+```
+
+Logs are not a secret-safe place: never enable this on a production or multi-user system, and only temporarily while diagnosing authentication failures.
 
 ## Building
 
