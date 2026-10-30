@@ -1,39 +1,25 @@
-version: 2
+name: release
+on:
+  push:
+    tags:
+      - "v*"
 
-before:
-  hooks:
-    - go mod tidy
+permissions:
+  contents: write
 
-builds:
-  - id: ntfy-mcp
-    main: .
-    binary: ntfy-mcp
-    env:
-      - CGO_ENABLED=0
-    goos:
-      - linux
-      - windows
-    goarch:
-      - amd64
-      - arm64
-    ignore:
-      - goos: windows
-        goarch: arm64
-    ldflags:
-      - -s -w -X main.Version={{.Version}}
-
-archives:
-  - formats: [tar.gz]
-    format_overrides:
-      - goos: windows
-        formats: [zip]
-    name_template: >-
-      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
-
-checksum:
-  name_template: "checksums.txt"
-
-release:
-  github:
-    owner: lmenjoulet
-    name: ntfy-mcp
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
