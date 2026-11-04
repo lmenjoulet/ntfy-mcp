@@ -19,6 +19,7 @@ Configure the server using environment variables:
 | `NTFY_TOKEN`           | *empty*           | Authentication token for the ntfy server                   |
 | `MCP_NTFY_ADDR`        | `127.0.0.1`       | Address to listen on for MCP connections                   |
 | `MCP_NTFY_PORT`        | `12120`           | Port to listen on for MCP connections                      |
+| `MCP_NTFY_CLIENT_TOKEN` | *empty*          | Shared secret MCP clients must send as `Authorization: Bearer <token>`; when set, unauthenticated requests are rejected with `401` |
 | `MCP_NTFY_UNSAFE_LOGS` | `0`               | Log level for unsafe logging; `1` logs tokens in cleartext |
 
 
@@ -75,6 +76,10 @@ services.ntfy-mcp = {
   # Token kept out of the Nix store, in a file containing one
   # NTFY_TOKEN=... line:
   tokenFile = "/run/secrets/ntfy-mcp-token";
+  # Optional: shared secret required from MCP clients (anti-spam when
+  # the server is exposed beyond loopback), in a file containing one
+  # MCP_NTFY_CLIENT_TOKEN=... line:
+  # clientTokenFile = "/run/secrets/ntfy-mcp-client-token";
   address = "127.0.0.1";   # listen address
   port = 12120;
 };
@@ -92,8 +97,20 @@ services.ntfy-mcp = {
 The server supports two deployment regimes, depending on whether the `NTFY_TOKEN` environment variable is set:
 
 - **Private server**: the token stays server-side (`NTFY_TOKEN`) and agents only provide `message`, `title`, `priority` and `tags`. The agent never sees any credential and cannot choose the ntfy server URL (to prevent token exfiltration).
-  - **TODO** implement a security mecanism to prevent unauthenticated users to spam notifications.
 - **Public server**: agents provide `base_url` and `token` themselves, which allows multiplexing several ntfy backends through one MCP server.
+
+### MCP client authentication (anti-spam)
+
+By default the server only listens on loopback. If you expose it more widely (`MCP_NTFY_ADDR=0.0.0.0`, or through a reverse proxy that does not authenticate clients), set `MCP_NTFY_CLIENT_TOKEN` to a shared secret: every MCP request must then carry it in an `Authorization: Bearer <token>` header, and any request without a valid token is rejected with `401 Unauthorized` before reaching the tools. This prevents unauthenticated users from spamming notifications through your ntfy topic. The comparison is constant-time and the presented token is never logged.
+
+```bash
+export MCP_NTFY_CLIENT_TOKEN=another_long_random_secret
+./ntfy-mcp
+# clients then call the endpoint with:
+#   Authorization: Bearer another_long_random_secret
+```
+
+When `MCP_NTFY_CLIENT_TOKEN` is empty (the default), no client authentication is performed — keep the server on loopback or behind an authenticated reverse proxy in that case.
 
 ### Logging
 
