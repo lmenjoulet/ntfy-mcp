@@ -2,15 +2,15 @@
 //
 // Configuration via environment variables:
 //
-//  NTFY_URL      Default ntfy server URL (default: https://ntfy.sh)
-//  NTFY_TOPIC    Default topic (default: agent)
-//  NTFY_TOKEN    Default token (default: empty)
+//	NTFY_URL      Default ntfy server URL (default: https://ntfy.sh)
+//	NTFY_TOPIC    Default topic (default: agent)
+//	NTFY_TOKEN    Default token (default: empty)
 //
-//  MCP_NTFY_ADDR MCP server listen address (default: 127.0.0.1)
-//  MCP_NTFY_PORT MCP server port (default: 12120)
+//	MCP_NTFY_ADDR MCP server listen address (default: 127.0.0.1)
+//	MCP_NTFY_PORT MCP server port (default: 12120)
 //
-//  MCP_NTFY_UNSAFE_LOGS  When set to "1", authentication tokens are logged
-//                        in cleartext (unsafe, debugging only; default: off)
+//	MCP_NTFY_UNSAFE_LOGS  When set to "1", authentication tokens are logged
+//	                      in cleartext (unsafe, debugging only; default: off)
 //
 // An agent can override any of these variables in an MCP request.
 // Configure them according to your security model.
@@ -59,7 +59,7 @@ type config struct {
 	Token      string
 	MCPAddr    string
 	MCPPort    int
-	UnsafeLogs string 
+	UnsafeLogs string
 }
 
 func loadConfig() (config, error) {
