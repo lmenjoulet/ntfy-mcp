@@ -7,7 +7,6 @@ Its goal is to be lightweight and act as the glue for agents running in harnesse
 
 This server allows MCP clients (usually AI agents) to send notifications to an [ntfy](https://ntfy.sh) server.
 
-
 ## Usage
 
 ### Running the server
@@ -25,6 +24,8 @@ export MCP_NTFY_PORT=12120
 ```
 
 By default the server only listens on loopback, at `http://127.0.0.1:12120/mcp`. Set `MCP_NTFY_ADDR=0.0.0.0` (or a specific interface address) to expose it — in that case, put it behind an authenticated reverse proxy.
+
+**TODO** Add a mode for the server to communicate over stdio (in a more usual MCP server way).
 
 ### Environment variables 
 
@@ -154,3 +155,6 @@ nix build
 ```
 
 The nix flake file has additional build options as it is intended for release builds.
+
+**TODO** Add a licence (GPLv3)
+**TODO** Add the server on common MCP registries
