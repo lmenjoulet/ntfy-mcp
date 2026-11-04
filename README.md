@@ -83,7 +83,7 @@ services.ntfy-mcp = {
 ## MCP capabilities
 
 - Send notifications
-- **TODO** Read notifications
+- Read cached notifications from a topic (`read_notifications`: optional `since`, `limit`, `cached_only`)
 
 ## Security considerations
 
