@@ -12,6 +12,15 @@
 //	                      in its "Authorization: Bearer" header (default: empty,
 //	                      no client authentication)
 //
+//	MCP_NTFY_RATE_LIMIT_FAILURES  Upstream rejections (HTTP 401/403/429) per
+//	                              target base URL tolerated within the window
+//	                              before the target is blocked (default: 5)
+//	MCP_NTFY_RATE_LIMIT_WINDOW    Sliding window for counting upstream
+//	                              rejections, in seconds (default: 60)
+//	MCP_NTFY_RATE_LIMIT_BLOCK     How long a target stays blocked, in seconds
+//	                              (default: 300); 0 or a negative failure
+//	                              limit disables the guard
+//
 //	MCP_NTFY_UNSAFE_LOGS  When set to "1", authentication tokens are logged
 //	                      in cleartext (unsafe, debugging only; default: off)
 //
@@ -36,6 +45,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -65,6 +75,105 @@ type config struct {
 	MCPPort     int
 	ClientToken string // Shared secret MCP clients must present; empty = no client auth
 	UnsafeLogs  string
+	Guard       *upstreamGuard // Anti-DoS guard on upstream ntfy targets; nil = disabled
+}
+
+// upstreamGuard protects third-party ntfy servers from being flooded
+// through this MCP server used as a proxy: when a target base URL
+// accumulates too many rejection responses (HTTP 401/403/429) within a
+// sliding window, that target is temporarily blocked and requests to it
+// are refused locally, without any upstream call.
+//
+// The guard is keyed by target base URL only (not by request token), so a
+// client cannot evade the block by rotating tokens against the same
+// target.
+type upstreamGuard struct {
+	mu           sync.Mutex
+	maxFailures  int
+	window       time.Duration
+	blockFor     time.Duration
+	rejections   map[string][]time.Time // target -> timestamps of recent upstream rejections
+	blockedUntil map[string]time.Time   // target -> end of the current block
+}
+
+func newUpstreamGuard(maxFailures, windowSec, blockSec int) *upstreamGuard {
+	if maxFailures <= 0 {
+		return nil // disabled
+	}
+	return &upstreamGuard{
+		maxFailures:  maxFailures,
+		window:       time.Duration(windowSec) * time.Second,
+		blockFor:     time.Duration(blockSec) * time.Second,
+		rejections:   map[string][]time.Time{},
+		blockedUntil: map[string]time.Time{},
+	}
+}
+
+// allow returns how long the target is still blocked; 0 means the request
+// may be forwarded upstream.
+func (g *upstreamGuard) allow(target string) time.Duration {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	until, blocked := g.blockedUntil[target]
+	if !blocked {
+		return 0
+	}
+	if remaining := time.Until(until); remaining > 0 {
+		return remaining
+	}
+	delete(g.blockedUntil, target)
+	return 0
+}
+
+// noteRejection records an upstream response status for the target and
+// blocks the target once maxFailures rejections (401/403/429) have been
+// seen within the sliding window. Other statuses are ignored.
+func (g *upstreamGuard) noteRejection(target string, status int) {
+	if status != http.StatusUnauthorized && status != http.StatusForbidden && status != http.StatusTooManyRequests {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-g.window)
+	kept := g.rejections[target][:0]
+	for _, t := range g.rejections[target] {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	g.rejections[target] = append(kept, now)
+	if len(g.rejections[target]) >= g.maxFailures {
+		g.blockedUntil[target] = now.Add(g.blockFor)
+		delete(g.rejections, target)
+		log.Printf("upstream target %q BLOCKED for %s after %d rejections (HTTP %d) within %s",
+			target, g.blockFor, g.maxFailures, status, g.window)
+	}
+}
+
+// checkUpstreamAllowed refuses the request locally when the target is
+// currently blocked by the anti-DoS guard.
+func (c config) checkUpstreamAllowed(baseURL string) error {
+	if c.Guard == nil {
+		return nil
+	}
+	if remaining := c.Guard.allow(baseURL); remaining > 0 {
+		log.Printf("BLOCKED request to %q: target temporarily blocked after repeated upstream rejections (retry in %s)",
+			baseURL, remaining.Round(time.Second))
+		return fmt.Errorf("target %s is temporarily blocked after repeated rejected requests (upstream 401/403/429); retry in %s",
+			baseURL, remaining.Round(time.Second))
+	}
+	return nil
+}
+
+// noteUpstreamStatus feeds the upstream response status to the anti-DoS
+// guard (no-op when the guard is disabled or the status is not a
+// rejection).
+func (c config) noteUpstreamStatus(baseURL string, status int) {
+	if c.Guard == nil {
+		return
+	}
+	c.Guard.noteRejection(baseURL, status)
 }
 
 func loadConfig() (config, error) {
@@ -75,6 +184,19 @@ func loadConfig() (config, error) {
 		return cfg, fmt.Errorf("error getting MCP_NTFY_PORT environment variable: %w", err)
 	}
 
+	maxFail, err := strconv.Atoi(getenv("MCP_NTFY_RATE_LIMIT_FAILURES", "5"))
+	if err != nil {
+		return cfg, fmt.Errorf("error getting MCP_NTFY_RATE_LIMIT_FAILURES environment variable: %w", err)
+	}
+	windowSec, err := strconv.Atoi(getenv("MCP_NTFY_RATE_LIMIT_WINDOW", "60"))
+	if err != nil {
+		return cfg, fmt.Errorf("error getting MCP_NTFY_RATE_LIMIT_WINDOW environment variable: %w", err)
+	}
+	blockSec, err := strconv.Atoi(getenv("MCP_NTFY_RATE_LIMIT_BLOCK", "300"))
+	if err != nil {
+		return cfg, fmt.Errorf("error getting MCP_NTFY_RATE_LIMIT_BLOCK environment variable: %w", err)
+	}
+
 	cfg = config{
 		BaseURL:     strings.TrimRight(getenv("NTFY_URL", "https://ntfy.sh"), "/"),
 		Topic:       getenv("NTFY_TOPIC", "agent"),
@@ -83,6 +205,12 @@ func loadConfig() (config, error) {
 		MCPPort:     mcpport,
 		ClientToken: getenv("MCP_NTFY_CLIENT_TOKEN", ""),
 		UnsafeLogs:  getenv("MCP_NTFY_UNSAFE_LOGS", "0"),
+		Guard:       newUpstreamGuard(maxFail, windowSec, blockSec),
+	}
+
+	if cfg.Guard != nil {
+		log.Printf("upstream anti-DoS guard enabled: %d rejections (401/403/429) within %ds block a target for %ds",
+			maxFail, windowSec, blockSec)
 	}
 
 	if cfg.ClientToken != "" {
@@ -182,6 +310,9 @@ func (c config) publish(ctx context.Context, args notificationArgs) error {
 	if err != nil {
 		return err
 	}
+	if err := c.checkUpstreamAllowed(baseURL); err != nil {
+		return err
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		baseURL+"/"+topic, strings.NewReader(args.Message))
@@ -222,6 +353,7 @@ func (c config) publish(ctx context.Context, args notificationArgs) error {
 		return fmt.Errorf("error sending to ntfy: %w", err)
 	}
 	log.Printf("ntfy response: HTTP status code %d", resp.StatusCode)
+	c.noteUpstreamStatus(baseURL, resp.StatusCode)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
@@ -288,6 +420,9 @@ func (c config) fetch(ctx context.Context, args readArgs) ([]ntfyNotification, e
 	if err != nil {
 		return nil, err
 	}
+	if err := c.checkUpstreamAllowed(baseURL); err != nil {
+		return nil, err
+	}
 
 	q := url.Values{}
 	q.Set("poll", "1")
@@ -326,6 +461,7 @@ func (c config) fetch(ctx context.Context, args readArgs) ([]ntfyNotification, e
 		return nil, fmt.Errorf("error reading from ntfy: %w", err)
 	}
 	log.Printf("ntfy response: HTTP status code %d", resp.StatusCode)
+	c.noteUpstreamStatus(baseURL, resp.StatusCode)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {

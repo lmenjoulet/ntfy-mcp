@@ -85,8 +85,12 @@ setsid env EXPECT_TOKEN="$TEST_TOKEN" go run "$SCRIPT_DIR/fake-ntfy.go" -addr "1
 FAKE_PID=$!
 
 echo "== starting ntfy-mcp on $MCP_BASE_URL =="
+# Short guard settings so phase 3 can exercise the anti-DoS block quickly:
+# 3 upstream 401s within 60s block the target for 2s.
 setsid env NTFY_URL="$FAKE_NTFY_URL" NTFY_TOPIC="$TEST_TOPIC" NTFY_TOKEN="$TEST_TOKEN" \
-    MCP_NTFY_PORT="$MCP_TEST_PORT" "$TMP/ntfy-mcp" >"$TMP/mcp.log" 2>&1 &
+    MCP_NTFY_PORT="$MCP_TEST_PORT" \
+    MCP_NTFY_RATE_LIMIT_FAILURES=3 MCP_NTFY_RATE_LIMIT_WINDOW=60 MCP_NTFY_RATE_LIMIT_BLOCK=2 \
+    "$TMP/ntfy-mcp" >"$TMP/mcp.log" 2>&1 &
 MCP_PID=$!
 
 wait_for_port 127.0.0.1 "$FAKE_NTFY_PORT"
@@ -222,6 +226,38 @@ assert_contains "auth server logs show client auth enabled" "$(cat "$TMP/mcp-aut
 MCP_BASE_URL="http://127.0.0.1:$MCP_TEST_PORT/mcp"
 MCP_AUTH_TOKEN=""
 MCP_AUTH_ARGS=()
+
+echo "== phase 3: upstream anti-DoS guard (block target after repeated 401s) =="
+# Test 11 above already caused one upstream 401 on $FAKE_NTFY_URL; with
+# MCP_NTFY_RATE_LIMIT_FAILURES=3, two more rejections trigger the block.
+R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$FAKE_NTFY_URL\",\"token\":\"wrong-token\"}")"
+assert_jq "2nd upstream 401 surfaces as tool error" "$R" '.result.isError' "true"
+R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$FAKE_NTFY_URL\",\"token\":\"wrong-token\"}")"
+assert_jq "3rd upstream 401 surfaces as tool error (triggers block)" "$R" '.result.isError' "true"
+
+# The target is now blocked: further requests are refused locally...
+R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$FAKE_NTFY_URL\",\"token\":\"wrong-token\"}")"
+assert_jq "4th request blocked locally" "$R" '.result.isError' "true"
+assert_contains "block message explains why" "$R" "temporarily blocked"
+# ...even with a valid token, because the guard is keyed by target URL
+# (rotating tokens must not evade the block).
+R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$FAKE_NTFY_URL\",\"token\":\"$TEST_TOKEN\"}")"
+assert_contains "valid token also blocked for that target" "$R" "temporarily blocked"
+
+# ...and nothing more was forwarded upstream: the fake ntfy saw exactly
+# the 3 rejected requests (1 from test 11 + 2 above).
+N401="$(grep -c 'HTTP 401' "$TMP/fake.log" || true)"
+if [ "$N401" = "3" ]; then
+    ok "blocked requests never forwarded (fake ntfy saw exactly 3 x 401)"
+else
+    ko "blocked requests never forwarded (fake ntfy saw $N401 x 401, want 3)"
+fi
+assert_contains "mcp log records the block" "$(cat "$TMP/mcp.log")" "BLOCKED"
+
+# After the block expires (MCP_NTFY_RATE_LIMIT_BLOCK=2s), the target works again.
+sleep 3
+R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$FAKE_NTFY_URL\",\"token\":\"$TEST_TOKEN\"}")"
+assert_contains "target usable again after block expiry" "$(printf '%s' "$R" | jq -r '.result.content[0].text')" "hello one"
 
 echo
 echo "== results: $PASS passed, $FAIL failed =="

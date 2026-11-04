@@ -53,6 +53,11 @@ just Go on `PATH`):
 - When exposing the server beyond loopback, require
   `MCP_NTFY_CLIENT_TOKEN` (anti-spam client authentication); the test
   suite covers the 401 paths.
+- Any code path that forwards a request to an upstream ntfy server must
+  go through the anti-DoS guard (`config.checkUpstreamAllowed` before the
+  HTTP call, `config.noteUpstreamStatus` with the response status after
+  it — see `upstreamGuard` in `main.go`). The test suite covers the block
+  and its expiry.
 - Any new tool that takes a `base_url` must keep the anti-exfiltration
   guard: a custom `base_url` requires a token in the same request
   (see `config.resolveTarget` in `main.go`). The test suite covers this.
