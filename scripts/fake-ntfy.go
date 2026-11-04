@@ -53,6 +53,7 @@ func main() {
 
 func handler(w http.ResponseWriter, r *http.Request) {
 	if expectToken != "" && r.Header.Get("Authorization") != "Bearer "+expectToken {
+		log.Printf("rejected %s %s: HTTP 401", r.Method, r.URL.RequestURI())
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		fmt.Fprint(w, `{"error":"unauthorized"}`)

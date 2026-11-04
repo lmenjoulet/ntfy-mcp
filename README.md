@@ -20,6 +20,9 @@ Configure the server using environment variables:
 | `MCP_NTFY_ADDR`        | `127.0.0.1`       | Address to listen on for MCP connections                   |
 | `MCP_NTFY_PORT`        | `12120`           | Port to listen on for MCP connections                      |
 | `MCP_NTFY_CLIENT_TOKEN` | *empty*          | Shared secret MCP clients must send as `Authorization: Bearer <token>`; when set, unauthenticated requests are rejected with `401` |
+| `MCP_NTFY_RATE_LIMIT_FAILURES` | `5`     | Upstream rejections (401/403/429) per target base URL tolerated within the window before the target is blocked; `0` disables the guard |
+| `MCP_NTFY_RATE_LIMIT_WINDOW` | `60`       | Sliding window for counting upstream rejections, in seconds       |
+| `MCP_NTFY_RATE_LIMIT_BLOCK` | `300`       | How long a target base URL stays blocked, in seconds              |
 | `MCP_NTFY_UNSAFE_LOGS` | `0`               | Log level for unsafe logging; `1` logs tokens in cleartext |
 
 
@@ -97,7 +100,7 @@ services.ntfy-mcp = {
 The server supports two deployment regimes, depending on whether the `NTFY_TOKEN` environment variable is set:
 
 - **Private server**: the token stays server-side (`NTFY_TOKEN`) and agents only provide `message`, `title`, `priority` and `tags`. The agent never sees any credential and cannot choose the ntfy server URL (to prevent token exfiltration).
-- **Public server**: agents provide `base_url` and `token` themselves, which allows multiplexing several ntfy backends through one MCP server.
+- **Public server**: agents provide `base_url` and `token` themselves — clients authenticate against the *target* ntfy server with their own token, so `MCP_NTFY_CLIENT_TOKEN` is not needed there (it stays optional, and only restricts who may use the MCP proxy at all). This allows multiplexing several ntfy backends through one MCP server.
 
 ### MCP client authentication (anti-spam)
 
@@ -111,6 +114,12 @@ export MCP_NTFY_CLIENT_TOKEN=another_long_random_secret
 ```
 
 When `MCP_NTFY_CLIENT_TOKEN` is empty (the default), no client authentication is performed — keep the server on loopback or behind an authenticated reverse proxy in that case.
+
+### Upstream rate limiting (anti proxy-DoS)
+
+In the public-server regime, a client could otherwise use this MCP server as a proxy to flood a third-party ntfy server (e.g. by sending many requests that the target rejects with `401`). To prevent that, the server keeps an **upstream guard**: when a target base URL accumulates `MCP_NTFY_RATE_LIMIT_FAILURES` rejection responses (`401`/`403`/`429`) within `MCP_NTFY_RATE_LIMIT_WINDOW` seconds, that target is blocked for `MCP_NTFY_RATE_LIMIT_BLOCK` seconds and requests to it are refused locally, **without any upstream call**.
+
+The guard is keyed by target base URL only, not by request token, so rotating tokens cannot evade the block. Set `MCP_NTFY_RATE_LIMIT_FAILURES=0` to disable it.
 
 ### Logging
 
