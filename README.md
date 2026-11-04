@@ -7,24 +7,6 @@ Its goal is to be lightweight and act as the glue for agents running in harnesse
 
 This server allows MCP clients (usually AI agents) to send notifications to an [ntfy](https://ntfy.sh) server.
 
-## Configuration
-
-Configure the server using environment variables:
-
-
-| Variable               | Default           | Description                                                |
-| ---------------------- | ----------------- | ---------------------------------------------------------- |
-| `NTFY_URL`             | `https://ntfy.sh` | Base URL of the ntfy server                                |
-| `NTFY_TOPIC`           | `agent`           | Default topic for notifications                            |
-| `NTFY_TOKEN`           | *empty*           | Authentication token for the ntfy server                   |
-| `MCP_NTFY_ADDR`        | `127.0.0.1`       | Address to listen on for MCP connections                   |
-| `MCP_NTFY_PORT`        | `12120`           | Port to listen on for MCP connections                      |
-| `MCP_NTFY_CLIENT_TOKEN` | *empty*          | Shared secret MCP clients must send as `Authorization: Bearer <token>`; when set, unauthenticated requests are rejected with `401` |
-| `MCP_NTFY_RATE_LIMIT_FAILURES` | `5`     | Upstream rejections (401/403/429) per target base URL tolerated within the window before the target is blocked; `0` disables the guard |
-| `MCP_NTFY_RATE_LIMIT_WINDOW` | `60`       | Sliding window for counting upstream rejections, in seconds       |
-| `MCP_NTFY_RATE_LIMIT_BLOCK` | `300`       | How long a target base URL stays blocked, in seconds              |
-| `MCP_NTFY_UNSAFE_LOGS` | `0`               | Log level for unsafe logging; `1` logs tokens in cleartext |
-
 
 ## Usage
 
@@ -43,6 +25,25 @@ export MCP_NTFY_PORT=12120
 ```
 
 By default the server only listens on loopback, at `http://127.0.0.1:12120/mcp`. Set `MCP_NTFY_ADDR=0.0.0.0` (or a specific interface address) to expose it — in that case, put it behind an authenticated reverse proxy.
+
+### Environment variables 
+
+Configure the server using environment variables:
+
+
+| Variable               | Default           | Description                                                |
+| ---------------------- | ----------------- | ---------------------------------------------------------- |
+| `NTFY_URL`             | `https://ntfy.sh` | Base URL of the ntfy server                                |
+| `NTFY_TOPIC`           | `agent`           | Default topic for notifications                            |
+| `NTFY_TOKEN`           | *empty*           | Authentication token for the ntfy server                   |
+| `MCP_NTFY_ADDR`        | `127.0.0.1`       | Address to listen on for MCP connections                   |
+| `MCP_NTFY_PORT`        | `12120`           | Port to listen on for MCP connections                      |
+| `MCP_NTFY_CLIENT_TOKEN` | *empty*          | Shared secret MCP clients must send as `Authorization: Bearer <token>`; when set, unauthenticated requests are rejected with `401` |
+| `MCP_NTFY_RATE_LIMIT_FAILURES` | `5`     | Upstream rejections (401/403/429) per target base URL tolerated within the window before the target is blocked; `0` disables the guard |
+| `MCP_NTFY_RATE_LIMIT_WINDOW` | `60`       | Sliding window for counting upstream rejections, in seconds       |
+| `MCP_NTFY_RATE_LIMIT_BLOCK` | `300`       | How long a target base URL stays blocked, in seconds              |
+| `MCP_NTFY_UNSAFE_LOGS` | `0`               | Log level for unsafe logging; `1` logs tokens in cleartext |
+
 
 ### Running as a NixOS service
 
