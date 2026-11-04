@@ -8,6 +8,9 @@
 //
 //	MCP_NTFY_ADDR MCP server listen address (default: 127.0.0.1)
 //	MCP_NTFY_PORT MCP server port (default: 12120)
+//	MCP_NTFY_CLIENT_TOKEN  When set, every MCP request must carry this token
+//	                      in its "Authorization: Bearer" header (default: empty,
+//	                      no client authentication)
 //
 //	MCP_NTFY_UNSAFE_LOGS  When set to "1", authentication tokens are logged
 //	                      in cleartext (unsafe, debugging only; default: off)
@@ -22,6 +25,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -54,12 +58,13 @@ var httpClient = &http.Client{
 
 // config holds the configuration loaded once at startup.
 type config struct {
-	BaseURL    string // Base URL, already normalized (no trailing slash)
-	Topic      string
-	Token      string
-	MCPAddr    string
-	MCPPort    int
-	UnsafeLogs string
+	BaseURL     string // Base URL, already normalized (no trailing slash)
+	Topic       string
+	Token       string
+	MCPAddr     string
+	MCPPort     int
+	ClientToken string // Shared secret MCP clients must present; empty = no client auth
+	UnsafeLogs  string
 }
 
 func loadConfig() (config, error) {
@@ -71,14 +76,18 @@ func loadConfig() (config, error) {
 	}
 
 	cfg = config{
-		BaseURL:    strings.TrimRight(getenv("NTFY_URL", "https://ntfy.sh"), "/"),
-		Topic:      getenv("NTFY_TOPIC", "agent"),
-		Token:      getenv("NTFY_TOKEN", ""),
-		MCPAddr:    getenv("MCP_NTFY_ADDR", "127.0.0.1"),
-		MCPPort:    mcpport,
-		UnsafeLogs: getenv("MCP_NTFY_UNSAFE_LOGS", "0"),
+		BaseURL:     strings.TrimRight(getenv("NTFY_URL", "https://ntfy.sh"), "/"),
+		Topic:       getenv("NTFY_TOPIC", "agent"),
+		Token:       getenv("NTFY_TOKEN", ""),
+		MCPAddr:     getenv("MCP_NTFY_ADDR", "127.0.0.1"),
+		MCPPort:     mcpport,
+		ClientToken: getenv("MCP_NTFY_CLIENT_TOKEN", ""),
+		UnsafeLogs:  getenv("MCP_NTFY_UNSAFE_LOGS", "0"),
 	}
 
+	if cfg.ClientToken != "" {
+		log.Print("MCP client authentication enabled: requests must carry the MCP_NTFY_CLIENT_TOKEN as a Bearer token")
+	}
 	if cfg.UnsafeLogs == "1" {
 		log.Print("WARNING: MCP_NTFY_UNSAFE_LOGS=1, tokens will appear in cleartext in the logs")
 	}
@@ -110,6 +119,32 @@ func sameOrigin(rawA, rawB string) bool {
 	return strings.EqualFold(a.Scheme, b.Scheme) &&
 		strings.EqualFold(a.Host, b.Host) &&
 		a.Path == b.Path
+}
+
+// withClientAuth wraps the MCP endpoint with a shared-secret check, so
+// that unauthenticated users cannot reach the tools (and spam the ntfy
+// topic) when the server is exposed beyond loopback. When secret is empty
+// the handler is returned unchanged: no client authentication.
+//
+// Clients must send "Authorization: Bearer <secret>". The comparison is
+// constant-time to avoid leaking the secret through timing. The presented
+// token is never logged.
+func withClientAuth(secret string, next http.Handler) http.Handler {
+	if secret == "" {
+		return next
+	}
+	const prefix = "Bearer "
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		presented := strings.TrimPrefix(r.Header.Get("Authorization"), prefix)
+		if presented == r.Header.Get("Authorization") ||
+			subtle.ConstantTimeCompare([]byte(presented), []byte(secret)) != 1 {
+			log.Printf("REJECTED MCP request from %s to %s %s: missing or invalid client token", r.RemoteAddr, r.Method, r.URL.Path)
+			w.Header().Set("WWW-Authenticate", `Bearer realm="ntfy-mcp"`)
+			http.Error(w, "unauthorized: a valid Bearer token is required", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // notificationArgs describes the parameters for the send_notification tool.
@@ -471,10 +506,21 @@ func main() {
 	srv.AddTool(buildNotificationTool(), notificationHandler(cfg))
 	srv.AddTool(buildReadTool(), readHandler(cfg))
 
-	httpSrv := server.NewStreamableHTTPServer(srv)
+	transport := server.NewStreamableHTTPServer(srv)
+
+	// Mount the MCP endpoint ourselves so the client-authentication
+	// middleware (anti-spam) can wrap it: withClientAuth returns the
+	// handler unchanged when MCP_NTFY_CLIENT_TOKEN is not set.
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", transport)
+
 	addr := fmt.Sprintf("%s:%d", cfg.MCPAddr, cfg.MCPPort)
+	httpSrv := &http.Server{
+		Addr:    addr,
+		Handler: withClientAuth(cfg.ClientToken, mux),
+	}
 	log.Printf("server v.%s listening on %s (path /mcp)", Version, addr)
-	if err := httpSrv.Start(addr); err != nil {
+	if err := httpSrv.ListenAndServe(); err != nil {
 		log.Fatalf("fatal error: %v", err)
 	}
 }

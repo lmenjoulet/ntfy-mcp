@@ -1,9 +1,17 @@
 # Common helpers for ntfy-mcp test scripts. Source this file, do not run it.
 #
 # Variables:
-#   MCP_BASE_URL  MCP endpoint (default: http://127.0.0.1:12321/mcp)
+#   MCP_BASE_URL   MCP endpoint (default: http://127.0.0.1:12321/mcp)
+#   MCP_AUTH_TOKEN When set, every request carries
+#                  "Authorization: Bearer $MCP_AUTH_TOKEN" (for servers
+#                  started with MCP_NTFY_CLIENT_TOKEN).
 
 MCP_BASE_URL="${MCP_BASE_URL:-http://127.0.0.1:12321/mcp}"
+
+MCP_AUTH_ARGS=()
+if [ -n "${MCP_AUTH_TOKEN:-}" ]; then
+    MCP_AUTH_ARGS=(-H "Authorization: Bearer $MCP_AUTH_TOKEN")
+fi
 
 # wait_for_http URL [TRIES] — succeed once URL answers any HTTP response.
 wait_for_http() {
@@ -41,6 +49,7 @@ mcp_initialize() {
     curl -s --max-time 10 -D "$headers" -o /dev/null -X POST "$MCP_BASE_URL" \
         -H "Content-Type: application/json" \
         -H "Accept: application/json, text/event-stream" \
+        "${MCP_AUTH_ARGS[@]}" \
         -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
     grep -i '^mcp-session-id:' "$headers" | tr -d '\r' | awk '{print $2}'
     rm -f "$headers"
@@ -52,6 +61,7 @@ mcp_notify_initialized() {
         -H "Content-Type: application/json" \
         -H "Accept: application/json, text/event-stream" \
         -H "Mcp-Session-Id: $1" \
+        "${MCP_AUTH_ARGS[@]}" \
         -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 }
 
@@ -61,6 +71,7 @@ mcp_call() {
         -H "Content-Type: application/json" \
         -H "Accept: application/json, text/event-stream" \
         -H "Mcp-Session-Id: $1" \
+        "${MCP_AUTH_ARGS[@]}" \
         -d "{\"jsonrpc\":\"2.0\",\"id\":$2,\"method\":\"$3\",\"params\":$4}"
 }
 

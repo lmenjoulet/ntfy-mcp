@@ -39,14 +39,20 @@ it in CI and never put a real token in a committed file.
 pipeline (e.g. GitHub Actions with `actions/setup-go` — no Nix needed,
 just Go on `PATH`):
 
-- ports are configurable via `FAKE_NTFY_PORT` and `MCP_TEST_PORT`;
+- ports are configurable via `FAKE_NTFY_PORT`, `MCP_TEST_PORT` and
+  `MCP_AUTH_TEST_PORT`;
 - no interaction, no external services;
 - standard exit codes (`0` pass, `1` fail).
 
 ## Security rules
 
 - Never log tokens in cleartext. Logs redact tokens by default;
-  `MCP_NTFY_UNSAFE_LOGS=1` is for local debugging only.
+  `MCP_NTFY_UNSAFE_LOGS=1` is for local debugging only. This applies to
+  `MCP_NTFY_CLIENT_TOKEN` too: the middleware in `main.go`
+  (`withClientAuth`) must never log the presented token.
+- When exposing the server beyond loopback, require
+  `MCP_NTFY_CLIENT_TOKEN` (anti-spam client authentication); the test
+  suite covers the 401 paths.
 - Any new tool that takes a `base_url` must keep the anti-exfiltration
   guard: a custom `base_url` requires a token in the same request
   (see `config.resolveTarget` in `main.go`). The test suite covers this.

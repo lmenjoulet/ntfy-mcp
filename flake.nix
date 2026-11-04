@@ -96,6 +96,20 @@
     dans la configuration.
         '';
       };
+
+      clientTokenFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = ''
+    Fichier contenant le secret partagé exigé des clients MCP, au format
+    MCP_NTFY_CLIENT_TOKEN=... (une ligne). Quand il est renseigné, toute
+    requête MCP doit porter ce secret en en-tête
+    "Authorization: Bearer ..." ; utile pour empêcher les utilisateurs
+    non authentifiés de spammer les notifications quand le serveur est
+    exposé au-delà de localhost. Préféré à un secret en clair dans la
+    configuration.
+        '';
+      };
     };
 
     config = lib.mkIf cfg.enable {
@@ -113,7 +127,9 @@
       "NTFY_URL=${cfg.ntfyUrl}"
       "NTFY_TOPIC=${cfg.ntfyTopic}"
     ];
-    EnvironmentFile = lib.mkIf (cfg.tokenFile != null) [ cfg.tokenFile ];
+    EnvironmentFile =
+      (lib.optional (cfg.tokenFile != null) cfg.tokenFile)
+      ++ (lib.optional (cfg.clientTokenFile != null) cfg.clientTokenFile);
     DynamicUser = true;
     NoNewPrivileges = true;
     PrivateTmp = true;
