@@ -60,9 +60,13 @@ Configure the server using environment variables:
 | `MCP_NTFY_PORT`        | `12120`           | Port to listen on for MCP connections (http transport only)   |
 | `MCP_NTFY_CLIENT_TOKEN` | *empty*          | Shared secret MCP clients must send as `Authorization: Bearer <token>`; when set, unauthenticated requests are rejected with `401` |
 | `MCP_NTFY_RATE_LIMIT_FAILURES` | `5`     | Upstream rejections (401/403/429) per target base URL tolerated within the window before the target is blocked; `0` disables the guard |
-| `MCP_NTFY_RATE_LIMIT_WINDOW` | `60`       | Sliding window for counting upstream rejections, in seconds       |
+| `MCP_NTFY_RATE_LIMIT_WINDOW` | `60`       | Sliding window, in seconds, for the upstream guard **and** the client rate limits below |
 | `MCP_NTFY_RATE_LIMIT_BLOCK` | `300`       | How long a target base URL stays blocked, in seconds              |
-| `MCP_NTFY_UNSAFE_LOGS` | `0`               | Log level for unsafe logging; `1` logs tokens in cleartext |
+| `MCP_NTFY_CLIENT_RATE_LIMIT` | `120`    | Max MCP requests per client IP within the window; over the limit → `429`; `0` disables |
+| `MCP_NTFY_AUTH_FAILURE_LIMIT` | `10`     | Max failed client authentications per IP within the window before `429` (anti brute force) |
+| `MCP_NTFY_MAX_CONCURRENT_UPSTREAM` | `32` | Max concurrent calls to upstream ntfy servers |
+| `MCP_NTFY_ALLOW_PRIVATE_UPSTREAM` | `0`   | `1` allows upstream connections to private/loopback/link-local IPs (self-hosted ntfy on the LAN only); by default such IPs are refused at dial time (anti-SSRF) |
+| `MCP_NTFY_UNSAFE_LOGS` | `0`               | Log level for unsafe logging; `1` logs tokens in cleartext (a startup warning is emitted if combined with a non-loopback `MCP_NTFY_ADDR`) |
 
 
 ### Running as a NixOS service
@@ -106,8 +110,13 @@ services.ntfy-mcp = {
   # clientTokenFile = "/run/secrets/ntfy-mcp-client-token";
   address = "127.0.0.1";   # listen address
   port = 12120;
+  # Only for a self-hosted ntfy on the local network: allows upstream
+  # connections to private/loopback IPs (refused by default, anti-SSRF):
+  # allowPrivateUpstream = true;
 };
 ```
+
+A NixOS evaluation warning is emitted when `address` is not loopback and `clientTokenFile` is not set. The service runs hardened (DynamicUser, `NoNewPrivileges`, `ProtectSystem=strict`, capability bounding set emptied, syscall filter, …).
 
 ## MCP capabilities
 
@@ -144,6 +153,28 @@ In the public-server regime, a client could otherwise use this MCP server as a p
 
 The guard is keyed by target base URL only, not by request token, so rotating tokens cannot evade the block. Set `MCP_NTFY_RATE_LIMIT_FAILURES=0` to disable it.
 
+### Upstream SSRF protection
+
+In the public-server regime (client-provided `base_url` + `token`), the server must never become an open proxy to the internal network. Two layers apply to every upstream connection:
+
+- **Scheme and shape**: `base_url` must be an absolute `http`/`https` URL without embedded credentials; anything else is rejected. The `topic` argument is restricted to the ntfy charset (`[A-Za-z0-9_-]{1,64}`), so it cannot inject path segments (`../`), query (`?`) or fragment (`#`) into the upstream URL.
+- **Dial-time IP check**: loopback, private (RFC 1918 + ULA), link-local (including the cloud metadata endpoint `169.254.169.254`), CGNAT, multicast and unspecified addresses are refused when the connection is established, on the *resolved* addresses, and the connection is pinned to a validated IP — so DNS rebinding cannot bypass it. TLS certificate verification is unaffected (ServerName still comes from the URL).
+
+Set `MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1` only if your ntfy server is self-hosted on a private/loopback address; this weakens the protection and should never be combined with an Internet-exposed MCP endpoint.
+
+### Rate limiting and resource caps (anti-DoS)
+
+- Per client IP (direct peer; `X-Forwarded-For` is deliberately not trusted): max `MCP_NTFY_CLIENT_RATE_LIMIT` MCP requests per `MCP_NTFY_RATE_LIMIT_WINDOW` seconds (`429` when exceeded), and max `MCP_NTFY_AUTH_FAILURE_LIMIT` failed authentications per window before `429` (anti brute force on `MCP_NTFY_CLIENT_TOKEN`).
+- MCP request bodies are capped at 1 MiB; the HTTP server sets read/write/idle timeouts so stalled clients cannot hold connections forever.
+- `message` is capped at 4096 bytes (the ntfy server limit).
+- `read_notifications` reads at most `limit` messages (default 100, hard cap 1000) and at most 4 MiB of stream.
+- At most `MCP_NTFY_MAX_CONCURRENT_UPSTREAM` upstream calls run concurrently.
+- The upstream guard's internal maps are size-capped, so spraying unique `base_url` values cannot exhaust memory.
+
+### Error handling and logging hygiene
+
+Errors caused by the client's own input (invalid `base_url`/`topic`, oversized `message`, temporarily blocked target) are returned explicitly to the MCP client. All other errors (network failures, upstream status/body, internal details) are logged server-side only and replaced by a generic message, so internal details and upstream response bodies never leak to MCP clients. Client-controlled fields are logged with `%q` to prevent log forging.
+
 ### Logging
 
 The server logs to stderr with the `[ntfy-mcp]` prefix. By default, tokens are replaced with `[redacted]` in log lines, which can be an annoyance when troubleshooting connection issues.
@@ -178,21 +209,6 @@ nix build
 The nix flake file has additional build options as it is intended for release builds.
 
 **TODO** Add the server on common MCP registries
-
-### Security hardening TODOs
-
-From a pre-production security audit (server will be exposed on an Internet-connected host):
-
-- Restrict the `base_url` tool argument to the `http`/`https` schemes (first step against SSRF; ideally also block private/loopback/link-local/metadata IPs, checked at dial time to resist DNS rebinding).
-- DoS hardening of the MCP HTTP server: set `ReadHeaderTimeout`/`ReadTimeout`/`WriteTimeout`/`IdleTimeout` on `http.Server`, cap request body size, cap `message` size, limit concurrency of upstream calls, and enforce a default/max `limit` in `read_notifications` (currently unbounded when `limit=0`).
-- Never return the upstream ntfy response body to the MCP client (only the HTTP status); log it server-side only.
-- Validate the `topic` argument (charset, e.g. `^[A-Za-z0-9_-]+$`) or `url.PathEscape` it before building the upstream URL (`?`, `#`, `../` currently inject into the request URL).
-- Cap the size of the upstream-guard maps (`rejections`/`blockedUntil`, keyed by client-supplied `base_url`) and add a general request rate limit — the guard only counts upstream 401/403/429 rejections, successful spam is unlimited.
-- Client auth: throttle repeated `401`s (online brute force of `MCP_NTFY_CLIENT_TOKEN`) and compare hashes instead of raw lengths in the constant-time comparison. TLS itself is delegated to a reverse proxy (see above).
-- Warn at startup when `MCP_NTFY_UNSAFE_LOGS=1` is combined with a non-loopback `MCP_NTFY_ADDR` (cleartext tokens in logs on an exposed host); keep the flag usable for production debugging.
-- Run `govulncheck ./...` in CI (and enable Dependabot/Renovate) to track dependency vulnerabilities (mcp-go, …).
-- NixOS module: add more systemd hardening (`CapabilityBoundingSet`, `RestrictAddressFamilies`, `SystemCallFilter`, `MemoryDenyWriteExecute`, `ProtectKernel*`, `PrivateDevices`, …) and warn when `address` is non-loopback without `clientTokenFile`.
-- Return generic error messages to MCP clients; keep internal details (DNS errors, upstream bodies) in server logs only.
 
 ## License
 

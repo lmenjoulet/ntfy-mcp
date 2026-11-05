@@ -61,4 +61,13 @@ just Go on `PATH`):
 - Any new tool that takes a `base_url` must keep the anti-exfiltration
   guard: a custom `base_url` requires a token in the same request
   (see `config.resolveTarget` in `main.go`). The test suite covers this.
+- Any new tool that takes a `base_url` must also go through
+  `validateBaseURL` (http/https only, no embedded credentials) and the
+  dial-time IP guard in `safeDialContext` (private/loopback/link-local/
+  metadata IPs refused unless `MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1`) —
+  the shared `httpClient` applies the latter automatically, keep using it.
+- Never return upstream response bodies or internal error details to
+  MCP clients: only `toolInputError` messages may cross back (see the
+  handlers in `main.go`). Log full detail server-side with `%q` on
+  client-controlled fields.
 - Test scripts must not contain real secrets.

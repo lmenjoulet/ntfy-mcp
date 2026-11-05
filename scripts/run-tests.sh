@@ -23,6 +23,7 @@ SCRIPT_DIR="$PWD/scripts"
 FAKE_NTFY_PORT="${FAKE_NTFY_PORT:-18099}"
 MCP_TEST_PORT="${MCP_TEST_PORT:-12321}"
 MCP_AUTH_PORT="${MCP_AUTH_TEST_PORT:-12322}"
+MCP_GUARD_PORT="${MCP_GUARD_TEST_PORT:-12323}"
 FAKE_NTFY_URL="http://127.0.0.1:$FAKE_NTFY_PORT"
 export MCP_BASE_URL="http://127.0.0.1:$MCP_TEST_PORT/mcp"
 TEST_TOKEN="test-secret-token"
@@ -32,11 +33,13 @@ TMP="$(mktemp -d)"
 FAKE_PID=""
 MCP_PID=""
 MCP_AUTH_PID=""
+MCP_GUARD_PID=""
 # Servers are started with setsid so cleanup can kill the whole process
 # group (e.g. "go run" and the compiled fake-ntfy it spawns).
 cleanup() {
     [ -n "$MCP_PID" ] && kill -- -"$MCP_PID" 2>/dev/null || true
     [ -n "$MCP_AUTH_PID" ] && kill -- -"$MCP_AUTH_PID" 2>/dev/null || true
+    [ -n "$MCP_GUARD_PID" ] && kill -- -"$MCP_GUARD_PID" 2>/dev/null || true
     [ -n "$FAKE_PID" ] && kill -- -"$FAKE_PID" 2>/dev/null || true
     rm -rf "$TMP"
 }
@@ -49,9 +52,9 @@ port_in_use() {
     fi
     return 1
 }
-if port_in_use "$FAKE_NTFY_PORT" || port_in_use "$MCP_TEST_PORT" || port_in_use "$MCP_AUTH_PORT"; then
-    echo "ERROR: port $FAKE_NTFY_PORT, $MCP_TEST_PORT or $MCP_AUTH_PORT is already in use;" >&2
-    echo "set FAKE_NTFY_PORT / MCP_TEST_PORT / MCP_AUTH_TEST_PORT to free ports" >&2
+if port_in_use "$FAKE_NTFY_PORT" || port_in_use "$MCP_TEST_PORT" || port_in_use "$MCP_AUTH_PORT" || port_in_use "$MCP_GUARD_PORT"; then
+    echo "ERROR: port $FAKE_NTFY_PORT, $MCP_TEST_PORT, $MCP_AUTH_PORT or $MCP_GUARD_PORT is already in use;" >&2
+    echo "set FAKE_NTFY_PORT / MCP_TEST_PORT / MCP_AUTH_TEST_PORT / MCP_GUARD_TEST_PORT to free ports" >&2
     exit 1
 fi
 
@@ -90,6 +93,7 @@ echo "== starting ntfy-mcp on $MCP_BASE_URL =="
 setsid env NTFY_URL="$FAKE_NTFY_URL" NTFY_TOPIC="$TEST_TOPIC" NTFY_TOKEN="$TEST_TOKEN" \
     MCP_NTFY_PORT="$MCP_TEST_PORT" \
     MCP_NTFY_RATE_LIMIT_FAILURES=3 MCP_NTFY_RATE_LIMIT_WINDOW=60 MCP_NTFY_RATE_LIMIT_BLOCK=2 \
+    MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1 \
     "$TMP/ntfy-mcp" >"$TMP/mcp.log" 2>&1 &
 MCP_PID=$!
 
@@ -163,6 +167,16 @@ assert_contains "read with request token works" "$(printf '%s' "$R" | jq -r '.re
 R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$FAKE_NTFY_URL\",\"token\":\"wrong-token\"}")"
 assert_jq "wrong token rejected" "$R" '.result.isError' "true"
 
+# 11b. Upstream error bodies are not leaked to the MCP client: the fake
+# ntfy 401 body ({"error":"unauthorized"}) must not appear in the tool
+# result, only the generic failure message. (This is a 2nd upstream 401
+# on the main instance's guard; phase 3's counts below account for the
+# one from test 11 only, because the guard blocks after 3 rejections.)
+R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$FAKE_NTFY_URL\",\"token\":\"wrong-token\"}")"
+assert_jq "upstream rejection surfaces as tool error" "$R" '.result.isError' "true"
+assert_not_contains "upstream body not leaked to client" "$R" '"error":"unauthorized"'
+assert_contains "client gets a generic upstream error" "$R" "failed to read notifications"
+
 # 12. The token never appears in cleartext in the server logs.
 if grep -qF -- "$TEST_TOKEN" "$TMP/mcp.log"; then
     ko "token absent from logs"
@@ -176,6 +190,7 @@ AUTH_URL="http://127.0.0.1:$MCP_AUTH_PORT/mcp"
 CLIENT_TOKEN="mcp-client-test-secret"
 setsid env NTFY_URL="$FAKE_NTFY_URL" NTFY_TOPIC="$TEST_TOPIC" NTFY_TOKEN="$TEST_TOKEN" \
     MCP_NTFY_PORT="$MCP_AUTH_PORT" MCP_NTFY_CLIENT_TOKEN="$CLIENT_TOKEN" \
+    MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1 \
     "$TMP/ntfy-mcp" >"$TMP/mcp-auth.log" 2>&1 &
 MCP_AUTH_PID=$!
 wait_for_port 127.0.0.1 "$MCP_AUTH_PORT"
@@ -194,6 +209,23 @@ code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST "$AUTH_URL" 
     -H 'Authorization: Bearer wrong-token' \
     -d "$INIT_BODY")"
 if [ "$code" = "401" ]; then ok "wrong client token -> HTTP 401"; else ko "wrong client token -> HTTP 401 (got $code)"; fi
+
+# 14b. Repeated failed authentications from one IP are throttled with 429
+# (MCP_NTFY_AUTH_FAILURE_LIMIT defaults to 10 per window; 2 failures so
+# far, so the 9th extra attempt already exceeds the limit).
+CODES=""
+for i in $(seq 1 10); do
+    c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST "$AUTH_URL" \
+        -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+        -H 'Authorization: Bearer wrong-token' \
+        -d "$INIT_BODY")"
+    CODES="$CODES $c"
+done
+if printf '%s' "$CODES" | grep -q '429'; then
+    ok "repeated auth failures throttled with HTTP 429 ($CODES)"
+else
+    ko "repeated auth failures throttled with HTTP 429 (got:$CODES)"
+fi
 
 # 15. With the correct token, the full MCP flow works.
 MCP_BASE_URL="$AUTH_URL"
@@ -228,10 +260,9 @@ MCP_AUTH_TOKEN=""
 MCP_AUTH_ARGS=()
 
 echo "== phase 3: upstream anti-DoS guard (block target after repeated 401s) =="
-# Test 11 above already caused one upstream 401 on $FAKE_NTFY_URL; with
-# MCP_NTFY_RATE_LIMIT_FAILURES=3, two more rejections trigger the block.
-R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$FAKE_NTFY_URL\",\"token\":\"wrong-token\"}")"
-assert_jq "2nd upstream 401 surfaces as tool error" "$R" '.result.isError' "true"
+# Tests 11 and 11b above already caused two upstream 401s on
+# $FAKE_NTFY_URL; with MCP_NTFY_RATE_LIMIT_FAILURES=3, one more
+# rejection triggers the block.
 R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$FAKE_NTFY_URL\",\"token\":\"wrong-token\"}")"
 assert_jq "3rd upstream 401 surfaces as tool error (triggers block)" "$R" '.result.isError' "true"
 
@@ -245,7 +276,7 @@ R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$
 assert_contains "valid token also blocked for that target" "$R" "temporarily blocked"
 
 # ...and nothing more was forwarded upstream: the fake ntfy saw exactly
-# the 3 rejected requests (1 from test 11 + 2 above).
+# the 3 rejected requests (tests 11, 11b and the first phase-3 call).
 N401="$(grep -c 'HTTP 401' "$TMP/fake.log" || true)"
 if [ "$N401" = "3" ]; then
     ok "blocked requests never forwarded (fake ntfy saw exactly 3 x 401)"
@@ -276,7 +307,7 @@ STDIO_OUT="$({ printf '%s\n' \
     printf '%s\n' \
     '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read_notifications","arguments":{}}}'; \
     sleep 3; } | env NTFY_URL="$FAKE_NTFY_URL" NTFY_TOPIC="$TEST_TOPIC" NTFY_TOKEN="$TEST_TOKEN" \
-        MCP_NTFY_TRANSPORT=stdio "$TMP/ntfy-mcp" 2>"$TMP/mcp-stdio.log")"
+        MCP_NTFY_TRANSPORT=stdio MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1 "$TMP/ntfy-mcp" 2>"$TMP/mcp-stdio.log")"
 
 assert_jq "stdio initialize handshake" "$STDIO_OUT" 'select(.id==1) | .result.serverInfo.name' "ntfy-mcp"
 STDIO_TOOLS="$(printf '%s' "$STDIO_OUT" | jq -r 'select(.id==2) | .result.tools[].name' 2>/dev/null || true)"
@@ -296,11 +327,54 @@ else
 fi
 assert_contains "invalid transport error is explicit" "$(cat "$TMP/mcp-bogus.log")" "not a valid transport"
 
+echo "== phase 5: input validation and SSRF guard (no MCP_NTFY_ALLOW_PRIVATE_UPSTREAM) =="
+# This instance runs with the secure defaults: private/loopback upstream
+# IPs are refused at dial time, base_url must be http(s), topic must
+# match the ntfy charset, message size is capped.
+setsid env NTFY_URL="$FAKE_NTFY_URL" NTFY_TOPIC="$TEST_TOPIC" NTFY_TOKEN="$TEST_TOKEN" \
+    MCP_NTFY_PORT="$MCP_GUARD_PORT" \
+    "$TMP/ntfy-mcp" >"$TMP/mcp-guard.log" 2>&1 &
+MCP_GUARD_PID=$!
+wait_for_port 127.0.0.1 "$MCP_GUARD_PORT"
+
+GUARD_URL="http://127.0.0.1:$MCP_GUARD_PORT/mcp"
+MCP_BASE_URL="$GUARD_URL"
+MCP_AUTH_TOKEN=""
+MCP_AUTH_ARGS=()
+GSESSION="$(mcp_initialize)"
+[ -n "$GSESSION" ] || { echo "FATAL: could not initialize guard-instance MCP session" >&2; exit 1; }
+mcp_notify_initialized "$GSESSION"
+
+# 18. Dial-time SSRF guard: a loopback target is refused even with a
+# request token (MCP_NTFY_ALLOW_PRIVATE_UPSTREAM is not set here).
+R="$(mcp_tool_call "$GSESSION" "$(next_id)" send_notification "{\"base_url\":\"$FAKE_NTFY_URL\",\"token\":\"$TEST_TOKEN\",\"message\":\"ssrf attempt\"}")"
+assert_jq "loopback upstream refused" "$R" '.result.isError' "true"
+assert_contains "refusal explains the IP block" "$R" "not allowed"
+
+# 19. Non-http(s) schemes are rejected.
+R="$(mcp_tool_call "$GSESSION" "$(next_id)" send_notification '{"base_url":"ftp://example.com","token":"x","message":"x"}')"
+assert_jq "ftp base_url rejected" "$R" '.result.isError' "true"
+assert_contains "scheme error mentions http/https" "$R" "http or https"
+
+# 20. Topic charset is validated: no path traversal / query injection.
+R="$(mcp_tool_call "$GSESSION" "$(next_id)" send_notification '{"topic":"../other?x=1","message":"x"}')"
+assert_jq "malicious topic rejected" "$R" '.result.isError' "true"
+assert_contains "topic error is explicit" "$R" "invalid topic"
+
+# 21. Message size is capped at the ntfy limit (4096 bytes).
+BIG="$(printf 'a%.0s' $(seq 1 5000))"
+R="$(mcp_tool_call "$GSESSION" "$(next_id)" send_notification "{\"message\":\"$BIG\"}")"
+assert_jq "oversized message rejected" "$R" '.result.isError' "true"
+assert_contains "size error mentions the limit" "$R" "4096"
+
+# Restore the default endpoint.
+MCP_BASE_URL="http://127.0.0.1:$MCP_TEST_PORT/mcp"
+
 echo
 echo "== results: $PASS passed, $FAIL failed =="
 if [ "$FAIL" -gt 0 ]; then
     # Stop the test processes but keep the logs around for debugging.
-    kill -- -"$MCP_PID" -"$MCP_AUTH_PID" -"$FAKE_PID" 2>/dev/null || true
+    kill -- -"$MCP_PID" -"$MCP_AUTH_PID" -"$MCP_GUARD_PID" -"$FAKE_PID" 2>/dev/null || true
     trap - EXIT
     echo "Test logs kept at: $TMP (mcp.log, fake.log)" >&2
     exit 1
