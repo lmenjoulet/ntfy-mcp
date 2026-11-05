@@ -2,7 +2,7 @@ module github.com/lmenjoulet/ntfy-mcp
 
 go 1.26.10
 
-require github.com/mark3labs/mcp-go v1.4.0
+require github.com/mark3labs/mcp-go v1.5.0
 
 require (
 	github.com/google/jsonschema-go v0.4.2 // indirect
