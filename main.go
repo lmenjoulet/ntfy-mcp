@@ -42,9 +42,8 @@
 //	                      direct peer IP is used). Set it only when a proxy
 //	                      you control appends the real client IP.
 //
-// An agent can override any of these variables in an MCP request.
-// Configure them according to your security model.
-// Example: Public MCP with known token, or private MCP.
+// In an MCP request, base_url, token and topic fall back to the configured
+// values above.
 // Usage: ntfy-mcp (http transport) or MCP_NTFY_TRANSPORT=stdio ntfy-mcp
 // (stdio transport, the usual way for MCP clients to spawn a local server)
 package main
@@ -239,11 +238,8 @@ func (l *lruMap[V]) delete(key string) {
 	}
 }
 
-// upstreamGuard temporarily blocks a target base URL that keeps getting
-// 401/403/429 upstream, so this server cannot be used to flood a
-// third-party ntfy. Keyed by canonical base URL only: rotating tokens or
-// trivial URL variants (trailing slash, default port, host letter case)
-// do not evade a block.
+// upstreamGuard temporarily blocks an upstream target that keeps answering
+// 401/403/429. Keyed by canonical target (scheme://host[:port]).
 type upstreamGuard struct {
 	mu           sync.Mutex
 	maxFailures  int
@@ -511,9 +507,8 @@ func validateBaseURL(raw string) error {
 	return nil
 }
 
-// canonicalTarget normalizes a base URL into the key used by the upstream
-// guard, so variants denoting the same target (trailing slash, default
-// port, host letter case) share a single block.
+// canonicalTarget reduces a base URL to scheme://host[:port], the key used
+// by the upstream guard. The path is not part of the key.
 func canonicalTarget(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme == "" || u.Host == "" {
@@ -529,7 +524,7 @@ func canonicalTarget(raw string) string {
 	if port != "" {
 		authority = net.JoinHostPort(host, port)
 	}
-	return scheme + "://" + authority + strings.TrimRight(u.Path, "/")
+	return scheme + "://" + authority
 }
 
 // isLoopbackAddr reports whether the listen address is loopback.
@@ -597,11 +592,10 @@ func (l *rateLimiter) allow(key string) bool {
 	return len(kept) <= l.max
 }
 
-// clientIP returns the client IP used for rate limiting. X-Forwarded-For is
-// only honored when the direct peer is a trusted proxy (see
-// MCP_NTFY_TRUSTED_PROXIES); its last entry is used because it is the one
-// appended by the proxy closest to this server. Otherwise the direct peer
-// IP is used (a client-supplied X-Forwarded-For is spoofable).
+// clientIP returns the key used for per-client rate limits: the last
+// X-Forwarded-For entry when the direct peer is a trusted proxy (see
+// MCP_NTFY_TRUSTED_PROXIES) and that entry is a valid IP, otherwise the
+// direct peer IP.
 func clientIP(r *http.Request, trusted []netip.Prefix) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -612,7 +606,8 @@ func clientIP(r *http.Request, trusted []netip.Prefix) string {
 			if p.Contains(addr) {
 				if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 					entries := strings.Split(xff, ",")
-					if last := strings.TrimSpace(entries[len(entries)-1]); last != "" {
+					last := strings.TrimSpace(entries[len(entries)-1])
+					if _, err := netip.ParseAddr(last); err == nil {
 						return last
 					}
 				}
@@ -627,7 +622,7 @@ func clientIP(r *http.Request, trusted []netip.Prefix) string {
 func withRateLimit(limiter *rateLimiter, trusted []netip.Prefix, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !limiter.allow(clientIP(r, trusted)) {
-			log.Printf("RATE LIMITED request from %s to %s %s: too many requests", r.RemoteAddr, r.Method, r.URL.Path)
+			log.Printf("RATE LIMITED request from %s to %s %q: too many requests", r.RemoteAddr, r.Method, r.URL.Path)
 			http.Error(w, "too many requests, retry later", http.StatusTooManyRequests)
 			return
 		}
@@ -668,11 +663,11 @@ func withClientAuth(secret string, failLimiter *rateLimiter, trusted []netip.Pre
 		if presented == r.Header.Get("Authorization") ||
 			subtle.ConstantTimeCompare(presentedHash[:], secretHash[:]) != 1 {
 			if !failLimiter.allow(clientIP(r, trusted)) {
-				log.Printf("THROTTLED MCP request from %s to %s %s: too many failed authentication attempts", r.RemoteAddr, r.Method, r.URL.Path)
+				log.Printf("THROTTLED MCP request from %s to %s %q: too many failed authentication attempts", r.RemoteAddr, r.Method, r.URL.Path)
 				http.Error(w, "too many failed authentication attempts, retry later", http.StatusTooManyRequests)
 				return
 			}
-			log.Printf("REJECTED MCP request from %s to %s %s: missing or invalid client token", r.RemoteAddr, r.Method, r.URL.Path)
+			log.Printf("REJECTED MCP request from %s to %s %q: missing or invalid client token", r.RemoteAddr, r.Method, r.URL.Path)
 			w.Header().Set("WWW-Authenticate", `Bearer realm="ntfy-mcp"`)
 			http.Error(w, "unauthorized: a valid Bearer token is required", http.StatusUnauthorized)
 			return
@@ -882,6 +877,7 @@ func (c config) resolveTarget(baseURL, token, topic string) (string, string, str
 	if baseURL == "" {
 		baseURL = c.BaseURL
 	}
+	baseURL = strings.TrimRight(baseURL, "/")
 	if baseURL != c.BaseURL && !sameOrigin(baseURL, c.BaseURL) && token == "" {
 		log.Printf("REJECTED custom base_url %q without request token: server token must not leave to an agent-chosen URL", baseURL)
 		return "", "", "", &toolInputError{"custom base_url requires a token in the request"}
@@ -1171,8 +1167,8 @@ func readHandler(cfg config) server.ToolHandlerFunc {
 }
 
 // healthzHandler answers liveness/readiness probes with a static 200.
-// It is registered on the same mux as /mcp, so when MCP_NTFY_CLIENT_TOKEN
-// is set it requires the Bearer token like every other endpoint.
+// It requires the Bearer token like every other endpoint when
+// MCP_NTFY_CLIENT_TOKEN is set, but is not rate-limited.
 func healthzHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1214,17 +1210,17 @@ func main() {
 
 	transport := server.NewStreamableHTTPServer(srv)
 
-	// Wrap the endpoints with the middlewares: rate limit first, then
-	// client auth (a no-op when MCP_NTFY_CLIENT_TOKEN is not set).
+	// /mcp is rate-limited per client IP and its body capped; /healthz stays
+	// outside the rate limit so probes are never throttled. Both endpoints
+	// require the Bearer token when MCP_NTFY_CLIENT_TOKEN is set.
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", transport)
+	mux.Handle("/mcp", withRateLimit(cfg.ClientLimiter, cfg.TrustedProxies, transport))
 	mux.HandleFunc("/healthz", healthzHandler)
 
 	addr := fmt.Sprintf("%s:%d", cfg.MCPAddr, cfg.MCPPort)
 	httpSrv := &http.Server{
 		Addr: addr,
-		Handler: withRateLimit(cfg.ClientLimiter, cfg.TrustedProxies,
-			withClientAuth(cfg.ClientToken, cfg.AuthFailLimiter, cfg.TrustedProxies, mux)),
+		Handler: withClientAuth(cfg.ClientToken, cfg.AuthFailLimiter, cfg.TrustedProxies, mux),
 		// Timeouts so stalled clients cannot hold connections open.
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
