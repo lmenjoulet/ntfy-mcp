@@ -25,7 +25,25 @@ export MCP_NTFY_PORT=12120
 
 By default the server only listens on loopback, at `http://127.0.0.1:12120/mcp`. Set `MCP_NTFY_ADDR=0.0.0.0` (or a specific interface address) to expose it — in that case, put it behind an authenticated reverse proxy.
 
-**TODO** Add a mode for the server to communicate over stdio (in a more usual MCP server way).
+### stdio transport
+
+Set `MCP_NTFY_TRANSPORT=stdio` to serve MCP over stdin/stdout (newline-delimited JSON-RPC) instead of HTTP — the usual way MCP clients such as Claude Desktop spawn a local server. Logs stay on stderr, so they never pollute the protocol channel. In this mode `MCP_NTFY_ADDR`, `MCP_NTFY_PORT` and `MCP_NTFY_CLIENT_TOKEN` have no effect (there are no HTTP headers to authenticate).
+
+```json
+{
+  "mcpServers": {
+    "ntfy": {
+      "command": "/path/to/ntfy-mcp",
+      "env": {
+        "MCP_NTFY_TRANSPORT": "stdio",
+        "NTFY_URL": "https://ntfy.sh",
+        "NTFY_TOPIC": "my-app",
+        "NTFY_TOKEN": "your_token_here"
+      }
+    }
+  }
+}
+```
 
 ### Environment variables 
 
@@ -37,8 +55,9 @@ Configure the server using environment variables:
 | `NTFY_URL`             | `https://ntfy.sh` | Base URL of the ntfy server                                |
 | `NTFY_TOPIC`           | `agent`           | Default topic for notifications                            |
 | `NTFY_TOKEN`           | *empty*           | Authentication token for the ntfy server                   |
-| `MCP_NTFY_ADDR`        | `127.0.0.1`       | Address to listen on for MCP connections                   |
-| `MCP_NTFY_PORT`        | `12120`           | Port to listen on for MCP connections                      |
+| `MCP_NTFY_TRANSPORT`   | `http`            | Transport: `http` (listen on ADDR:PORT) or `stdio` (MCP over stdin/stdout) |
+| `MCP_NTFY_ADDR`        | `127.0.0.1`       | Address to listen on for MCP connections (http transport only) |
+| `MCP_NTFY_PORT`        | `12120`           | Port to listen on for MCP connections (http transport only)   |
 | `MCP_NTFY_CLIENT_TOKEN` | *empty*          | Shared secret MCP clients must send as `Authorization: Bearer <token>`; when set, unauthenticated requests are rejected with `401` |
 | `MCP_NTFY_RATE_LIMIT_FAILURES` | `5`     | Upstream rejections (401/403/429) per target base URL tolerated within the window before the target is blocked; `0` disables the guard |
 | `MCP_NTFY_RATE_LIMIT_WINDOW` | `60`       | Sliding window for counting upstream rejections, in seconds       |

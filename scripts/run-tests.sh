@@ -259,6 +259,43 @@ sleep 3
 R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$FAKE_NTFY_URL\",\"token\":\"$TEST_TOKEN\"}")"
 assert_contains "target usable again after block expiry" "$(printf '%s' "$R" | jq -r '.result.content[0].text')" "hello one"
 
+echo "== phase 4: stdio transport (MCP_NTFY_TRANSPORT=stdio) =="
+# Newline-delimited JSON-RPC on stdin; the server exits cleanly at EOF.
+# stdin is held open briefly after the last message: mcp-go cancels the
+# context of in-flight requests when it sees EOF, which would abort the
+# send_notification HTTP call before it reaches the fake ntfy server.
+# The stdio server dispatches requests concurrently, so the read is sent
+# only after a pause: otherwise its GET could reach the fake ntfy before
+# the send's POST has been published.
+STDIO_OUT="$({ printf '%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"stdio-test","version":"1.0"}}}' \
+    '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"send_notification","arguments":{"message":"hello via stdio","title":"Stdio"}}}'; \
+    sleep 2; \
+    printf '%s\n' \
+    '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read_notifications","arguments":{}}}'; \
+    sleep 3; } | env NTFY_URL="$FAKE_NTFY_URL" NTFY_TOPIC="$TEST_TOPIC" NTFY_TOKEN="$TEST_TOKEN" \
+        MCP_NTFY_TRANSPORT=stdio "$TMP/ntfy-mcp" 2>"$TMP/mcp-stdio.log")"
+
+assert_jq "stdio initialize handshake" "$STDIO_OUT" 'select(.id==1) | .result.serverInfo.name' "ntfy-mcp"
+STDIO_TOOLS="$(printf '%s' "$STDIO_OUT" | jq -r 'select(.id==2) | .result.tools[].name' 2>/dev/null || true)"
+assert_contains "stdio tools/list exposes send_notification" "$STDIO_TOOLS" "send_notification"
+assert_contains "stdio tools/list exposes read_notifications" "$STDIO_TOOLS" "read_notifications"
+assert_jq "stdio send_notification succeeds" "$STDIO_OUT" 'select(.id==3) | .result.content[0].text' "Notification sent successfully."
+STDIO_READ="$(printf '%s' "$STDIO_OUT" | jq -r 'select(.id==4) | .result.content[0].text' 2>/dev/null || true)"
+assert_contains "stdio read_notifications sees the stdio-sent message" "$STDIO_READ" "hello via stdio"
+assert_not_contains "logs stay off the stdio protocol channel" "$STDIO_OUT" "[ntfy-mcp]"
+assert_contains "stdio mode logged on stderr" "$(cat "$TMP/mcp-stdio.log")" "serving MCP over stdio"
+
+# An invalid transport value is rejected at startup.
+if env MCP_NTFY_TRANSPORT=bogus "$TMP/ntfy-mcp" >/dev/null 2>"$TMP/mcp-bogus.log"; then
+    ko "invalid MCP_NTFY_TRANSPORT rejected at startup"
+else
+    ok "invalid MCP_NTFY_TRANSPORT rejected at startup"
+fi
+assert_contains "invalid transport error is explicit" "$(cat "$TMP/mcp-bogus.log")" "not a valid transport"
+
 echo
 echo "== results: $PASS passed, $FAIL failed =="
 if [ "$FAIL" -gt 0 ]; then

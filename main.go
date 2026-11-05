@@ -6,8 +6,9 @@
 //	NTFY_TOPIC    Default topic (default: agent)
 //	NTFY_TOKEN    Default token (default: empty)
 //
-//	MCP_NTFY_ADDR MCP server listen address (default: 127.0.0.1)
-//	MCP_NTFY_PORT MCP server port (default: 12120)
+//	MCP_NTFY_TRANSPORT  Transport: "http" (default) or "stdio"
+//	MCP_NTFY_ADDR MCP server listen address, http transport only (default: 127.0.0.1)
+//	MCP_NTFY_PORT MCP server port, http transport only (default: 12120)
 //	MCP_NTFY_CLIENT_TOKEN  When set, every MCP request must carry this token
 //	                      in its "Authorization: Bearer" header (default: empty,
 //	                      no client authentication)
@@ -27,7 +28,8 @@
 // An agent can override any of these variables in an MCP request.
 // Configure them according to your security model.
 // Example: Public MCP with known token, or private MCP.
-// Usage: ntfy-mcp (communicates over stdin/stdout)
+// Usage: ntfy-mcp (http transport) or MCP_NTFY_TRANSPORT=stdio ntfy-mcp
+// (stdio transport, the usual way for MCP clients to spawn a local server)
 package main
 
 import (
@@ -71,8 +73,9 @@ type config struct {
 	BaseURL     string // Base URL, already normalized (no trailing slash)
 	Topic       string
 	Token       string
-	MCPAddr     string
-	MCPPort     int
+	Transport   string // "http" or "stdio"
+	MCPAddr     string // http transport only
+	MCPPort     int    // http transport only
 	ClientToken string // Shared secret MCP clients must present; empty = no client auth
 	UnsafeLogs  string
 	Guard       *upstreamGuard // Anti-DoS guard on upstream ntfy targets; nil = disabled
@@ -197,15 +200,25 @@ func loadConfig() (config, error) {
 		return cfg, fmt.Errorf("error getting MCP_NTFY_RATE_LIMIT_BLOCK environment variable: %w", err)
 	}
 
+	transport := strings.ToLower(getenv("MCP_NTFY_TRANSPORT", "http"))
+	if transport != "http" && transport != "stdio" {
+		return cfg, fmt.Errorf("error getting MCP_NTFY_TRANSPORT environment variable: %q is not a valid transport (want \"http\" or \"stdio\")", transport)
+	}
+
 	cfg = config{
 		BaseURL:     strings.TrimRight(getenv("NTFY_URL", "https://ntfy.sh"), "/"),
 		Topic:       getenv("NTFY_TOPIC", "agent"),
 		Token:       getenv("NTFY_TOKEN", ""),
+		Transport:   transport,
 		MCPAddr:     getenv("MCP_NTFY_ADDR", "127.0.0.1"),
 		MCPPort:     mcpport,
 		ClientToken: getenv("MCP_NTFY_CLIENT_TOKEN", ""),
 		UnsafeLogs:  getenv("MCP_NTFY_UNSAFE_LOGS", "0"),
 		Guard:       newUpstreamGuard(maxFail, windowSec, blockSec),
+	}
+
+	if transport == "stdio" && cfg.ClientToken != "" {
+		log.Print("WARNING: MCP_NTFY_CLIENT_TOKEN is set but has no effect in stdio mode (no HTTP headers to check); ignoring it")
 	}
 
 	if cfg.Guard != nil {
@@ -641,6 +654,18 @@ func main() {
 
 	srv.AddTool(buildNotificationTool(), notificationHandler(cfg))
 	srv.AddTool(buildReadTool(), readHandler(cfg))
+
+	if cfg.Transport == "stdio" {
+		// Stdio transport: newline-delimited JSON-RPC on stdin/stdout,
+		// the usual way MCP clients (Claude Desktop, etc.) spawn a local
+		// server. Logs stay on stderr so they never pollute the protocol
+		// channel on stdout.
+		log.Printf("server v.%s serving MCP over stdio", Version)
+		if err := server.ServeStdio(srv); err != nil {
+			log.Fatalf("fatal error: %v", err)
+		}
+		return
+	}
 
 	transport := server.NewStreamableHTTPServer(srv)
 
