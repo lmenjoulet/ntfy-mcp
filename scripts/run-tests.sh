@@ -25,6 +25,7 @@ MCP_TEST_PORT="${MCP_TEST_PORT:-12321}"
 MCP_AUTH_PORT="${MCP_AUTH_TEST_PORT:-12322}"
 MCP_GUARD_PORT="${MCP_GUARD_TEST_PORT:-12323}"
 MCP_PROXY_PORT="${MCP_PROXY_TEST_PORT:-12324}"
+MCP_SHUTDOWN_PORT="${MCP_SHUTDOWN_TEST_PORT:-12325}"
 FAKE_NTFY_URL="http://127.0.0.1:$FAKE_NTFY_PORT"
 export MCP_BASE_URL="http://127.0.0.1:$MCP_TEST_PORT/mcp"
 TEST_TOKEN="test-secret-token"
@@ -36,6 +37,7 @@ MCP_PID=""
 MCP_AUTH_PID=""
 MCP_GUARD_PID=""
 MCP_PROXY_PID=""
+MCP_SHUTDOWN_PID=""
 # Servers are started with setsid so cleanup can kill the whole process
 # group (e.g. "go run" and the compiled fake-ntfy it spawns).
 cleanup() {
@@ -43,6 +45,7 @@ cleanup() {
     [ -n "$MCP_AUTH_PID" ] && kill -- -"$MCP_AUTH_PID" 2>/dev/null || true
     [ -n "$MCP_GUARD_PID" ] && kill -- -"$MCP_GUARD_PID" 2>/dev/null || true
     [ -n "$MCP_PROXY_PID" ] && kill -- -"$MCP_PROXY_PID" 2>/dev/null || true
+    [ -n "$MCP_SHUTDOWN_PID" ] && kill -- -"$MCP_SHUTDOWN_PID" 2>/dev/null || true
     [ -n "$FAKE_PID" ] && kill -- -"$FAKE_PID" 2>/dev/null || true
     rm -rf "$TMP"
 }
@@ -55,9 +58,9 @@ port_in_use() {
     fi
     return 1
 }
-if port_in_use "$FAKE_NTFY_PORT" || port_in_use "$MCP_TEST_PORT" || port_in_use "$MCP_AUTH_PORT" || port_in_use "$MCP_GUARD_PORT" || port_in_use "$MCP_PROXY_PORT"; then
-    echo "ERROR: port $FAKE_NTFY_PORT, $MCP_TEST_PORT, $MCP_AUTH_PORT, $MCP_GUARD_PORT or $MCP_PROXY_PORT is already in use;" >&2
-    echo "set FAKE_NTFY_PORT / MCP_TEST_PORT / MCP_AUTH_TEST_PORT / MCP_GUARD_TEST_PORT / MCP_PROXY_TEST_PORT to free ports" >&2
+if port_in_use "$FAKE_NTFY_PORT" || port_in_use "$MCP_TEST_PORT" || port_in_use "$MCP_AUTH_PORT" || port_in_use "$MCP_GUARD_PORT" || port_in_use "$MCP_PROXY_PORT" || port_in_use "$MCP_SHUTDOWN_PORT"; then
+    echo "ERROR: port $FAKE_NTFY_PORT, $MCP_TEST_PORT, $MCP_AUTH_PORT, $MCP_GUARD_PORT, $MCP_PROXY_PORT or $MCP_SHUTDOWN_PORT is already in use;" >&2
+    echo "set FAKE_NTFY_PORT / MCP_TEST_PORT / MCP_AUTH_TEST_PORT / MCP_GUARD_TEST_PORT / MCP_PROXY_TEST_PORT / MCP_SHUTDOWN_TEST_PORT to free ports" >&2
     exit 1
 fi
 
@@ -475,6 +478,55 @@ if printf '%s' "$CODES" | grep -q '429'; then
 else
     ko "no X-Forwarded-For falls back to the peer IP and is throttled (got:$CODES)"
 fi
+
+echo "== phase 7: /healthz and graceful shutdown (SIGTERM/SIGINT) =="
+
+# 24. /healthz answers 200 "ok" on the plain instance (no client token set).
+code="$(curl -s -o "$TMP/healthz.body" -w '%{http_code}' --max-time 5 "http://127.0.0.1:$MCP_TEST_PORT/healthz")"
+if [ "$code" = "200" ]; then ok "/healthz returns HTTP 200"; else ko "/healthz returns HTTP 200 (got $code)"; fi
+assert_contains "/healthz body is ok" "$(cat "$TMP/healthz.body")" "ok"
+
+# 25. Only GET/HEAD are allowed on /healthz.
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST "http://127.0.0.1:$MCP_TEST_PORT/healthz" \
+    -H 'Content-Type: application/json' -d '{}')"
+if [ "$code" = "405" ]; then ok "POST /healthz -> HTTP 405"; else ko "POST /healthz -> HTTP 405 (got $code)"; fi
+
+# 26-28. Dedicated instance for the auth + signal tests on a fresh port.
+start_shutdown_instance() { # $1 = extra env assignment (may be empty)
+    setsid env NTFY_URL="$FAKE_NTFY_URL" NTFY_TOPIC="$TEST_TOPIC" NTFY_TOKEN="$TEST_TOKEN" \
+        MCP_NTFY_PORT="$MCP_SHUTDOWN_PORT" MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1 $1 \
+        "$TMP/ntfy-mcp" >"$TMP/mcp-shutdown.log" 2>&1 &
+    MCP_SHUTDOWN_PID=$!
+    wait_for_port 127.0.0.1 "$MCP_SHUTDOWN_PORT"
+}
+stop_with_signal() { # $1 = signal name; sets RC to the server exit code
+    kill "-$1" "$MCP_SHUTDOWN_PID"
+    ( sleep 10; kill -9 "$MCP_SHUTDOWN_PID" 2>/dev/null ) & # bound the wait
+    local killer=$!
+    RC=0
+    wait "$MCP_SHUTDOWN_PID" || RC=$?
+    kill "$killer" 2>/dev/null || true
+}
+
+# With MCP_NTFY_CLIENT_TOKEN set, /healthz requires the Bearer token like
+# every other endpoint.
+start_shutdown_instance "MCP_NTFY_CLIENT_TOKEN=$CLIENT_TOKEN"
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$MCP_SHUTDOWN_PORT/healthz")"
+if [ "$code" = "401" ]; then ok "/healthz without client token -> HTTP 401"; else ko "/healthz without client token -> HTTP 401 (got $code)"; fi
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H "Authorization: Bearer $CLIENT_TOKEN" "http://127.0.0.1:$MCP_SHUTDOWN_PORT/healthz")"
+if [ "$code" = "200" ]; then ok "/healthz with client token -> HTTP 200"; else ko "/healthz with client token -> HTTP 200 (got $code)"; fi
+
+# SIGTERM: graceful exit 0, shutdown logged, listener closed.
+stop_with_signal TERM
+if [ "$RC" = "0" ]; then ok "SIGTERM -> graceful exit code 0"; else ko "SIGTERM -> graceful exit code 0 (got $RC)"; fi
+assert_contains "SIGTERM shutdown logged" "$(cat "$TMP/mcp-shutdown.log")" "shutdown signal received"
+assert_contains "drain completes before exit" "$(cat "$TMP/mcp-shutdown.log")" "graceful shutdown complete"
+if port_in_use "$MCP_SHUTDOWN_PORT"; then ko "listener closed after SIGTERM"; else ok "listener closed after SIGTERM"; fi
+
+# SIGINT behaves the same.
+start_shutdown_instance ""
+stop_with_signal INT
+if [ "$RC" = "0" ]; then ok "SIGINT -> graceful exit code 0"; else ko "SIGINT -> graceful exit code 0 (got $RC)"; fi
 
 echo
 echo "== results: $PASS passed, $FAIL failed =="
