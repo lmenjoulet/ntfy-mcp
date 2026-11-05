@@ -125,6 +125,18 @@
     refusées au moment de la connexion (protection anti-SSRF).
         '';
       };
+
+      trustedProxies = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = ''
+          IPs/CIDRs de proxys inverses dont l'en-tête X-Forwarded-For est
+          pris en compte pour les limites de débit par client
+          (MCP_NTFY_TRUSTED_PROXIES). À renseigner quand le serveur est
+          derrière un proxy inverse sur la même machine, ex.
+          [ "127.0.0.1/32" ] avec un nginx local.
+        '';
+      };
     };
 
     config = lib.mkIf cfg.enable {
@@ -147,7 +159,8 @@
       "NTFY_URL=${cfg.ntfyUrl}"
       "NTFY_TOPIC=${cfg.ntfyTopic}"
     ]
-    ++ lib.optional cfg.allowPrivateUpstream "MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1";
+    ++ lib.optional cfg.allowPrivateUpstream "MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1"
+    ++ lib.optional (cfg.trustedProxies != [ ]) "MCP_NTFY_TRUSTED_PROXIES=${lib.concatStringsSep "," cfg.trustedProxies}";
     EnvironmentFile =
       (lib.optional (cfg.tokenFile != null) cfg.tokenFile)
       ++ (lib.optional (cfg.clientTokenFile != null) cfg.clientTokenFile);
