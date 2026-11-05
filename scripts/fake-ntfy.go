@@ -34,6 +34,11 @@ type message struct {
 	Title    string   `json:"title,omitempty"`
 	Priority int      `json:"priority,omitempty"`
 	Tags     []string `json:"tags,omitempty"`
+	Click    string   `json:"click,omitempty"`
+	Icon     string   `json:"icon,omitempty"`
+	Delay    string   `json:"delay,omitempty"`
+	Email    string   `json:"email,omitempty"`
+	Markdown bool     `json:"markdown,omitempty"`
 }
 
 var (
@@ -74,6 +79,11 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			Message:  string(body),
 			Title:    r.Header.Get("Title"),
 			Priority: atoi(r.Header.Get("Priority")),
+			Click:    r.Header.Get("Click"),
+			Icon:     r.Header.Get("Icon"),
+			Delay:    r.Header.Get("Delay"),
+			Email:    r.Header.Get("Email"),
+			Markdown: r.Header.Get("Markdown") == "yes",
 		}
 		if tags := r.Header.Get("Tags"); tags != "" {
 			msg.Tags = strings.Split(tags, ",")

@@ -151,6 +151,37 @@ assert_contains "since=id-1 keeps second message" "$T" "hello two"
 R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications '{"topic":"no-such-topic"}')"
 assert_jq "empty topic reported" "$R" '.result.content[0].text' "No notifications found."
 
+# 7b. Extended ntfy fields (click, icon, delay, email, markdown) are forwarded
+# upstream and come back on read. Own topic so the default-topic reads below
+# stay unaffected.
+R="$(mcp_tool_call "$SESSION" "$(next_id)" send_notification '{"message":"rich","topic":"fieldstopic","title":"Rich","click":"https://example.com/docs","icon":"https://example.com/icon.png","delay":"30min","email":"ops@example.com","markdown":true}')"
+assert_jq "send with extended fields succeeds" "$R" '.result.content[0].text' "Notification sent successfully."
+R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications '{"topic":"fieldstopic"}')"
+T="$(printf '%s' "$R" | jq -r '.result.content[0].text')"
+assert_contains "click round-trips" "$T" "https://example.com/docs"
+assert_contains "icon round-trips" "$T" "https://example.com/icon.png"
+assert_contains "delay round-trips" "$T" "30min"
+assert_contains "email round-trips" "$T" "ops@example.com"
+assert_contains "markdown round-trips" "$T" '"markdown": true'
+
+# 7c. Extended-field validation rejects bad input before any upstream call
+# (so the anti-DoS rejection counts in phase 3 are unaffected).
+R="$(mcp_tool_call "$SESSION" "$(next_id)" send_notification '{"message":"x","click":"javascript:alert(1)"}')"
+assert_jq "javascript: click rejected" "$R" '.result.isError' "true"
+assert_contains "click scheme error is explicit" "$R" "http(s)"
+R="$(mcp_tool_call "$SESSION" "$(next_id)" send_notification '{"message":"x","icon":"ftp://example.com/i.png"}')"
+assert_jq "non-http(s) icon rejected" "$R" '.result.isError' "true"
+R="$(mcp_tool_call "$SESSION" "$(next_id)" send_notification '{"message":"x","delay":"30min\nX-Evil: 1"}')"
+assert_jq "delay with control chars rejected" "$R" '.result.isError' "true"
+assert_contains "delay error is explicit" "$R" "invalid delay"
+R="$(mcp_tool_call "$SESSION" "$(next_id)" send_notification '{"message":"x","email":"not-an-email"}')"
+assert_jq "invalid email rejected" "$R" '.result.isError' "true"
+assert_contains "email error is explicit" "$R" "invalid email"
+BIGCLICK="https://example.com/$(printf 'a%.0s' $(seq 1 2100))"
+R="$(mcp_tool_call "$SESSION" "$(next_id)" send_notification "{\"message\":\"x\",\"click\":\"$BIGCLICK\"}")"
+assert_jq "oversized click rejected" "$R" '.result.isError' "true"
+assert_contains "click size error mentions the limit" "$R" "2048"
+
 # 8. Empty message is rejected (protocol-level error, not a tool error).
 R="$(mcp_tool_call "$SESSION" "$(next_id)" send_notification '{"message":"   "}')"
 assert_contains "empty message rejected" "$R" "message parameter cannot be empty"
