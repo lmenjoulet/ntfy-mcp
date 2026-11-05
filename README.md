@@ -173,7 +173,6 @@ nix build  # release build via the flake
 ## TODO
 
 - Graceful shutdown on SIGTERM/SIGINT and a `/healthz` health endpoint
-- Pin GitHub Actions to commit SHAs instead of version tags
 - Add the server to common MCP registries
 
 ## License
