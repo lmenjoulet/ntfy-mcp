@@ -24,6 +24,7 @@ FAKE_NTFY_PORT="${FAKE_NTFY_PORT:-18099}"
 MCP_TEST_PORT="${MCP_TEST_PORT:-12321}"
 MCP_AUTH_PORT="${MCP_AUTH_TEST_PORT:-12322}"
 MCP_GUARD_PORT="${MCP_GUARD_TEST_PORT:-12323}"
+MCP_PROXY_PORT="${MCP_PROXY_TEST_PORT:-12324}"
 FAKE_NTFY_URL="http://127.0.0.1:$FAKE_NTFY_PORT"
 export MCP_BASE_URL="http://127.0.0.1:$MCP_TEST_PORT/mcp"
 TEST_TOKEN="test-secret-token"
@@ -34,12 +35,14 @@ FAKE_PID=""
 MCP_PID=""
 MCP_AUTH_PID=""
 MCP_GUARD_PID=""
+MCP_PROXY_PID=""
 # Servers are started with setsid so cleanup can kill the whole process
 # group (e.g. "go run" and the compiled fake-ntfy it spawns).
 cleanup() {
     [ -n "$MCP_PID" ] && kill -- -"$MCP_PID" 2>/dev/null || true
     [ -n "$MCP_AUTH_PID" ] && kill -- -"$MCP_AUTH_PID" 2>/dev/null || true
     [ -n "$MCP_GUARD_PID" ] && kill -- -"$MCP_GUARD_PID" 2>/dev/null || true
+    [ -n "$MCP_PROXY_PID" ] && kill -- -"$MCP_PROXY_PID" 2>/dev/null || true
     [ -n "$FAKE_PID" ] && kill -- -"$FAKE_PID" 2>/dev/null || true
     rm -rf "$TMP"
 }
@@ -52,9 +55,9 @@ port_in_use() {
     fi
     return 1
 }
-if port_in_use "$FAKE_NTFY_PORT" || port_in_use "$MCP_TEST_PORT" || port_in_use "$MCP_AUTH_PORT" || port_in_use "$MCP_GUARD_PORT"; then
-    echo "ERROR: port $FAKE_NTFY_PORT, $MCP_TEST_PORT, $MCP_AUTH_PORT or $MCP_GUARD_PORT is already in use;" >&2
-    echo "set FAKE_NTFY_PORT / MCP_TEST_PORT / MCP_AUTH_TEST_PORT / MCP_GUARD_TEST_PORT to free ports" >&2
+if port_in_use "$FAKE_NTFY_PORT" || port_in_use "$MCP_TEST_PORT" || port_in_use "$MCP_AUTH_PORT" || port_in_use "$MCP_GUARD_PORT" || port_in_use "$MCP_PROXY_PORT"; then
+    echo "ERROR: port $FAKE_NTFY_PORT, $MCP_TEST_PORT, $MCP_AUTH_PORT, $MCP_GUARD_PORT or $MCP_PROXY_PORT is already in use;" >&2
+    echo "set FAKE_NTFY_PORT / MCP_TEST_PORT / MCP_AUTH_TEST_PORT / MCP_GUARD_TEST_PORT / MCP_PROXY_TEST_PORT to free ports" >&2
     exit 1
 fi
 
@@ -275,6 +278,11 @@ assert_contains "block message explains why" "$R" "temporarily blocked"
 R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$FAKE_NTFY_URL\",\"token\":\"$TEST_TOKEN\"}")"
 assert_contains "valid token also blocked for that target" "$R" "temporarily blocked"
 
+# The block is keyed on the canonical target: a trailing-slash variant of
+# the same URL must not evade it.
+R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$FAKE_NTFY_URL/\",\"token\":\"$TEST_TOKEN\"}")"
+assert_contains "trailing-slash variant also blocked" "$R" "temporarily blocked"
+
 # ...and nothing more was forwarded upstream: the fake ntfy saw exactly
 # the 3 rejected requests (tests 11, 11b and the first phase-3 call).
 N401="$(grep -c 'HTTP 401' "$TMP/fake.log" || true)"
@@ -367,14 +375,81 @@ R="$(mcp_tool_call "$GSESSION" "$(next_id)" send_notification "{\"message\":\"$B
 assert_jq "oversized message rejected" "$R" '.result.isError' "true"
 assert_contains "size error mentions the limit" "$R" "4096"
 
+# 22. NAT64 well-known prefix (64:ff9b::/96) is refused at dial time.
+R="$(mcp_tool_call "$GSESSION" "$(next_id)" send_notification "{\"base_url\":\"http://[64:ff9b::1]/\",\"token\":\"x\",\"message\":\"x\"}")"
+assert_jq "NAT64 prefix refused" "$R" '.result.isError' "true"
+assert_contains "NAT64 refusal explains the IP block" "$R" "not allowed"
+
+# 23. Title and tags are size-capped before any upstream call.
+BIGTITLE="$(printf 't%.0s' $(seq 1 600))"
+R="$(mcp_tool_call "$GSESSION" "$(next_id)" send_notification "{\"title\":\"$BIGTITLE\",\"message\":\"x\"}")"
+assert_jq "oversized title rejected" "$R" '.result.isError' "true"
+assert_contains "title error mentions the limit" "$R" "512"
+BIGTAGS="$(printf 'g%.0s' $(seq 1 600))"
+R="$(mcp_tool_call "$GSESSION" "$(next_id)" send_notification "{\"tags\":\"$BIGTAGS\",\"message\":\"x\"}")"
+assert_jq "oversized tags rejected" "$R" '.result.isError' "true"
+assert_contains "tags error mentions the limit" "$R" "512"
+
 # Restore the default endpoint.
 MCP_BASE_URL="http://127.0.0.1:$MCP_TEST_PORT/mcp"
+
+echo "== phase 6: trusted proxy (MCP_NTFY_TRUSTED_PROXIES) =="
+# This instance trusts X-Forwarded-For from loopback peers and has a low
+# client rate limit (5 per 60s) so the per-IP buckets are observable.
+setsid env NTFY_URL="$FAKE_NTFY_URL" NTFY_TOPIC="$TEST_TOPIC" NTFY_TOKEN="$TEST_TOKEN" \
+    MCP_NTFY_PORT="$MCP_PROXY_PORT" \
+    MCP_NTFY_CLIENT_RATE_LIMIT=5 MCP_NTFY_RATE_LIMIT_WINDOW=60 \
+    MCP_NTFY_TRUSTED_PROXIES="127.0.0.0/8" \
+    MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1 \
+    "$TMP/ntfy-mcp" >"$TMP/mcp-proxy.log" 2>&1 &
+MCP_PROXY_PID=$!
+wait_for_port 127.0.0.1 "$MCP_PROXY_PORT"
+
+PROXY_URL="http://127.0.0.1:$MCP_PROXY_PORT/mcp"
+proxy_post() { # [XFF] -> http status code
+    if [ -n "${1:-}" ]; then
+        curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST "$PROXY_URL" \
+            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+            -H "X-Forwarded-For: $1" -d "$INIT_BODY"
+    else
+        curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST "$PROXY_URL" \
+            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+            -d "$INIT_BODY"
+    fi
+}
+
+# Same forwarded IP: the first 5 requests pass, the 6th is throttled.
+CODES=""
+for i in $(seq 1 6); do CODES="$CODES $(proxy_post 10.9.9.9)"; done
+if printf '%s' "$CODES" | grep -q '429'; then
+    ok "same X-Forwarded-For IP throttled after 5 requests ($CODES)"
+else
+    ko "same X-Forwarded-For IP throttled after 5 requests (got:$CODES)"
+fi
+
+# Distinct forwarded IPs: each gets its own bucket, no 429.
+CODES=""
+for i in $(seq 1 8); do CODES="$CODES $(proxy_post "10.8.8.$i")"; done
+if printf '%s' "$CODES" | grep -q '429'; then
+    ko "distinct X-Forwarded-For IPs not throttled (got:$CODES)"
+else
+    ok "distinct X-Forwarded-For IPs not throttled ($CODES)"
+fi
+
+# Without X-Forwarded-For the direct peer IP (127.0.0.1) is the key.
+CODES=""
+for i in $(seq 1 6); do CODES="$CODES $(proxy_post)"; done
+if printf '%s' "$CODES" | grep -q '429'; then
+    ok "no X-Forwarded-For falls back to the peer IP and is throttled ($CODES)"
+else
+    ko "no X-Forwarded-For falls back to the peer IP and is throttled (got:$CODES)"
+fi
 
 echo
 echo "== results: $PASS passed, $FAIL failed =="
 if [ "$FAIL" -gt 0 ]; then
     # Stop the test processes but keep the logs around for debugging.
-    kill -- -"$MCP_PID" -"$MCP_AUTH_PID" -"$MCP_GUARD_PID" -"$FAKE_PID" 2>/dev/null || true
+    kill -- -"$MCP_PID" -"$MCP_AUTH_PID" -"$MCP_GUARD_PID" -"$MCP_PROXY_PID" -"$FAKE_PID" 2>/dev/null || true
     trap - EXIT
     echo "Test logs kept at: $TMP (mcp.log, fake.log)" >&2
     exit 1
