@@ -84,6 +84,10 @@ const (
 	maxMessageBytes  = 4096    // ntfy limit for a notification body
 	maxTitleBytes    = 512     // cap on the Title header sent upstream
 	maxTagsBytes     = 512     // cap on the Tags header sent upstream
+	maxClickBytes    = 2048    // cap on the Click header (a URL) sent upstream
+	maxIconBytes     = 2048    // cap on the Icon header (a URL) sent upstream
+	maxDelayBytes    = 64      // cap on the Delay header sent upstream
+	maxEmailBytes    = 254     // RFC 5321 maximum length of an email address
 	maxFetchBytes    = 4 << 20 // cap on bytes read from an upstream stream
 	defaultReadLimit = 100     // read_notifications limit when omitted
 	maxReadLimit     = 1000    // hard cap on read_notifications limit
@@ -473,6 +477,26 @@ func parseTrustedProxies(s string) ([]netip.Prefix, error) {
 // injection into the upstream URL.
 var topicRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
+// delayRe is the charset ntfy accepts in the Delay header (relative
+// durations like "30min" or absolute timestamps like "2025-12-31 18:00").
+var delayRe = regexp.MustCompile(`^[0-9A-Za-z ,.:+-]{1,64}$`)
+
+// emailRe is a pragmatic email check for the Email (forward) header.
+var emailRe = regexp.MustCompile(`^[^@\s]{1,64}@[^@\s]{1,190}\.[^@\s]{1,63}$`)
+
+// validatePublicURL checks that raw is an absolute http(s) URL without
+// credentials. Used for the click and icon fields: a notification must not
+// carry a javascript: or other dangerous scheme that a client app could
+// execute when the user interacts with it.
+func validatePublicURL(field, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil ||
+		(!strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https")) {
+		return &toolInputError{fmt.Sprintf("%s must be an absolute http(s) URL without embedded credentials", field)}
+	}
+	return nil
+}
+
 // validateBaseURL accepts only absolute http(s) URLs without credentials.
 func validateBaseURL(raw string) error {
 	u, err := url.Parse(raw)
@@ -663,7 +687,12 @@ type notificationArgs struct {
 	Title    string `json:"title,omitempty"`
 	Topic    string `json:"topic,omitempty"`
 	Priority int    `json:"priority,omitempty"`
-	Tags     string `json:"tags,omitempty"` // Comma-separated (e.g., "warning,phone")
+	Tags     string `json:"tags,omitempty"`  // Comma-separated (e.g., "warning,phone")
+	Click    string `json:"click,omitempty"` // URL opened when the notification is clicked
+	Icon     string `json:"icon,omitempty"`  // URL of an icon shown with the notification
+	Delay    string `json:"delay,omitempty"` // Delivery delay, e.g. "30min" or "2025-12-31 18:00"
+	Email    string `json:"email,omitempty"` // Email address the notification is forwarded to
+	Markdown bool   `json:"markdown,omitempty"`
 }
 
 func parseArgs[T any](request mcp.CallToolRequest) (T, error) {
@@ -698,6 +727,34 @@ func (c config) publish(ctx context.Context, args notificationArgs) error {
 	if len(args.Tags) > maxTagsBytes {
 		return &toolInputError{fmt.Sprintf("tags exceed the %d-byte limit", maxTagsBytes)}
 	}
+	if len(args.Click) > maxClickBytes {
+		return &toolInputError{fmt.Sprintf("click exceeds the %d-byte limit", maxClickBytes)}
+	}
+	if args.Click != "" {
+		if err := validatePublicURL("click", args.Click); err != nil {
+			return err
+		}
+	}
+	if len(args.Icon) > maxIconBytes {
+		return &toolInputError{fmt.Sprintf("icon exceeds the %d-byte limit", maxIconBytes)}
+	}
+	if args.Icon != "" {
+		if err := validatePublicURL("icon", args.Icon); err != nil {
+			return err
+		}
+	}
+	if len(args.Delay) > maxDelayBytes {
+		return &toolInputError{fmt.Sprintf("delay exceeds the %d-byte limit", maxDelayBytes)}
+	}
+	if args.Delay != "" && !delayRe.MatchString(args.Delay) {
+		return &toolInputError{"invalid delay: use a relative duration like \"30min\" or an absolute time like \"2025-12-31 18:00\""}
+	}
+	if len(args.Email) > maxEmailBytes {
+		return &toolInputError{fmt.Sprintf("email exceeds the %d-byte limit", maxEmailBytes)}
+	}
+	if args.Email != "" && !emailRe.MatchString(args.Email) {
+		return &toolInputError{"invalid email: expected a plain address like \"ops@example.com\""}
+	}
 	if err := c.acquireUpstreamSlot(ctx); err != nil {
 		return err
 	}
@@ -721,8 +778,8 @@ func (c config) publish(ctx context.Context, args notificationArgs) error {
 		logToken = "%q"
 		tokenArgs = token
 	}
-	log.Printf("publishing: POST %q/%q (title=%q, priority=%d, tags=%q, token "+logToken+")",
-		baseURL, topic, args.Title, args.Priority, args.Tags, tokenArgs)
+	log.Printf("publishing: POST %q/%q (title=%q, priority=%d, tags=%q, click=%q, icon=%q, delay=%q, email=%q, markdown=%t, token "+logToken+")",
+		baseURL, topic, args.Title, args.Priority, args.Tags, args.Click, args.Icon, args.Delay, args.Email, args.Markdown, tokenArgs)
 
 	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
 
@@ -733,6 +790,21 @@ func (c config) publish(ctx context.Context, args notificationArgs) error {
 	}
 	if args.Tags != "" {
 		req.Header.Set("Tags", args.Tags)
+	}
+	if args.Click != "" {
+		req.Header.Set("Click", args.Click)
+	}
+	if args.Icon != "" {
+		req.Header.Set("Icon", args.Icon)
+	}
+	if args.Delay != "" {
+		req.Header.Set("Delay", args.Delay)
+	}
+	if args.Email != "" {
+		req.Header.Set("Email", args.Email)
+	}
+	if args.Markdown {
+		req.Header.Set("Markdown", "yes")
 	}
 
 	resp, err := httpClient.Do(req)
@@ -796,6 +868,9 @@ type ntfyNotification struct {
 	Tags     []string `json:"tags,omitempty"`
 	Click    string   `json:"click,omitempty"`
 	Icon     string   `json:"icon,omitempty"`
+	Delay    string   `json:"delay,omitempty"`
+	Email    string   `json:"email,omitempty"`
+	Markdown bool     `json:"markdown,omitempty"`
 }
 
 // resolveTarget applies server-side defaults. A custom base_url requires
@@ -973,6 +1048,21 @@ func buildNotificationTool() mcp.Tool {
 		mcp.WithString("tags",
 			mcp.Description("Comma-separated tags, e.g., \"warning,phone\"."),
 		),
+		mcp.WithString("click",
+			mcp.Description("URL opened when the notification is clicked (http or https only)."),
+		),
+		mcp.WithString("icon",
+			mcp.Description("URL of an icon shown with the notification (http or https only)."),
+		),
+		mcp.WithString("delay",
+			mcp.Description("Deliver the notification later: a relative duration like \"30min\" or an absolute time like \"2025-12-31 18:00\"."),
+		),
+		mcp.WithString("email",
+			mcp.Description("Email address the notification is also forwarded to (requires server-side email config)."),
+		),
+		mcp.WithBoolean("markdown",
+			mcp.Description("Render the message as Markdown in clients that support it."),
+		),
 	)
 }
 
@@ -990,8 +1080,8 @@ func notificationHandler(cfg config) server.ToolHandlerFunc {
 		if cfg.UnsafeLogs != "1" {
 			logged.Token = "[redacted]"
 		}
-		log.Printf("send_notification called with: base_url=%q topic=%q title=%q priority=%d tags=%q message_len=%d token=%q",
-			logged.BaseURL, logged.Topic, logged.Title, logged.Priority, logged.Tags, len(args.Message), logged.Token)
+		log.Printf("send_notification called with: base_url=%q topic=%q title=%q priority=%d tags=%q click=%q icon=%q delay=%q email=%q markdown=%t message_len=%d token=%q",
+			logged.BaseURL, logged.Topic, logged.Title, logged.Priority, logged.Tags, logged.Click, logged.Icon, logged.Delay, logged.Email, logged.Markdown, len(args.Message), logged.Token)
 
 		if strings.TrimSpace(args.Message) == "" {
 			log.Print("ERROR: message parameter is empty")

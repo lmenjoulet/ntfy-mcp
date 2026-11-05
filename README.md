@@ -111,8 +111,8 @@ Example configuration with an nginx reverse proxy.
 
 ## MCP capabilities
 
-- Send notifications
-- Read cached notifications from a topic 
+- Send notifications, with optional `title`, `priority`, `tags`, `click` (URL opened on click), `icon`, `delay` (deferred delivery), `email` (forwarding) and `markdown` rendering
+- Read cached notifications from a topic
 
 ## Security considerations
 
@@ -174,7 +174,6 @@ nix build  # release build via the flake
 
 - Graceful shutdown on SIGTERM/SIGINT and a `/healthz` health endpoint
 - Pin GitHub Actions to commit SHAs instead of version tags
-- Expose more ntfy fields in `send_notification` (`click`, `icon`, `delay`, ...)
 - Add the server to common MCP registries
 
 ## License
