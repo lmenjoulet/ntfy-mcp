@@ -16,7 +16,7 @@
       packages = forEachSystem ({ pkgs }: {
   ntfy-mcp = pkgs.buildGoModule rec {
     pname = "ntfy-mcp";
-    version = "0.1.0";
+    version = "0.5.0";
     src = self;
     ldflags = [
       "-X main.Version=${version}"
