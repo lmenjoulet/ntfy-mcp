@@ -114,9 +114,25 @@
     configuration.
         '';
       };
+
+      allowPrivateUpstream = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+    Autorise les connexions montantes vers des IP privées/loopback
+    (MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1). À n'activer que pour un serveur
+    ntfy auto-hébergé sur le réseau local ; par défaut, ces adresses sont
+    refusées au moment de la connexion (protection anti-SSRF).
+        '';
+      };
     };
 
     config = lib.mkIf cfg.enable {
+      warnings =
+        lib.optional
+          (!(builtins.elem cfg.address [ "127.0.0.1" "::1" "localhost" ]) && cfg.clientTokenFile == null)
+          "ntfy-mcp: address is not loopback and clientTokenFile is not set: the MCP server will be reachable without client authentication; set clientTokenFile or expose it only behind an authenticated TLS reverse proxy.";
+
       systemd.services.ntfy-mcp = {
         description = "Serveur MCP d'envoi de notifications ntfy";
         after = [ "network-online.target" ];
@@ -130,15 +146,33 @@
       "MCP_NTFY_PORT=${toString cfg.port}"
       "NTFY_URL=${cfg.ntfyUrl}"
       "NTFY_TOPIC=${cfg.ntfyTopic}"
-    ];
+    ]
+    ++ lib.optional cfg.allowPrivateUpstream "MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1";
     EnvironmentFile =
       (lib.optional (cfg.tokenFile != null) cfg.tokenFile)
       ++ (lib.optional (cfg.clientTokenFile != null) cfg.clientTokenFile);
     DynamicUser = true;
     NoNewPrivileges = true;
     PrivateTmp = true;
+    PrivateDevices = true;
     ProtectSystem = "strict";
     ProtectHome = true;
+    ProtectKernelTunables = true;
+    ProtectKernelModules = true;
+    ProtectKernelLogs = true;
+    ProtectClock = true;
+    ProtectHostname = true;
+    ProtectControlGroups = true;
+    RestrictNamespaces = true;
+    RestrictRealtime = true;
+    RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+    CapabilityBoundingSet = "";
+    AmbientCapabilities = "";
+    LockPersonality = true;
+    MemoryDenyWriteExecute = true;
+    RemoveIPC = true;
+    SystemCallFilter = [ "@system-service" ];
+    SystemCallErrorNumber = "EPERM";
     Restart = "on-failure";
         };
       };
