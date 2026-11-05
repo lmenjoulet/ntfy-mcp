@@ -1,5 +1,10 @@
 # ntfy-mcp
 
+[![CI (tests + govulncheck)](https://github.com/lmenjoulet/ntfy-mcp/actions/workflows/ci.yaml/badge.svg)](https://github.com/lmenjoulet/ntfy-mcp/actions/workflows/ci.yaml)
+[![Security (OSSF Scorecard)](https://api.securityscorecards.dev/projects/github.com/lmenjoulet/ntfy-mcp/badge)](https://securityscorecards.dev/viewer/?uri=github.com/lmenjoulet/ntfy-mcp)
+[![Go](https://img.shields.io/github/go-mod/go-version/lmenjoulet/ntfy-mcp?logo=go&logoColor=white)](https://go.dev/)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
+
 A [Model Context Protocol (MCP)](https://github.com/modelcontextprotocol/spec) server that exposes a tool to send notifications via [ntfy](https://ntfy.sh/).  
 Its goal is to be lightweight and act as the glue for agents running in harnesses that don't give them full HTTP client capabilities.
 
