@@ -170,7 +170,12 @@ go build   # with Go on PATH
 nix build  # release build via the flake
 ```
 
-**TODO** Add the server on common MCP registries
+## TODO
+
+- Graceful shutdown on SIGTERM/SIGINT and a `/healthz` health endpoint
+- Pin GitHub Actions to commit SHAs instead of version tags
+- Expose more ntfy fields in `send_notification` (`click`, `icon`, `delay`, ...)
+- Add the server to common MCP registries
 
 ## License
 
