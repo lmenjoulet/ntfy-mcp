@@ -200,6 +200,10 @@ assert_jq "send to custom base_url without token rejected" "$R" '.result.isError
 R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$FAKE_NTFY_URL\",\"token\":\"$TEST_TOKEN\"}")"
 assert_contains "read with request token works" "$(printf '%s' "$R" | jq -r '.result.content[0].text')" "hello one"
 
+# 10b. A trailing slash on base_url is normalized (no "//topic" upstream).
+R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$FAKE_NTFY_URL/\",\"token\":\"$TEST_TOKEN\"}")"
+assert_contains "trailing-slash base_url works" "$(printf '%s' "$R" | jq -r '.result.content[0].text')" "hello one"
+
 # 11. Wrong token is rejected by the ntfy server (proves the token is forwarded).
 R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$FAKE_NTFY_URL\",\"token\":\"wrong-token\"}")"
 assert_jq "wrong token rejected" "$R" '.result.isError' "true"
@@ -312,10 +316,14 @@ assert_contains "block message explains why" "$R" "temporarily blocked"
 R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$FAKE_NTFY_URL\",\"token\":\"$TEST_TOKEN\"}")"
 assert_contains "valid token also blocked for that target" "$R" "temporarily blocked"
 
-# The block is keyed on the canonical target: a trailing-slash variant of
-# the same URL must not evade it.
+# The guard key ignores the path: a trailing-slash variant of the same URL
+# is blocked too.
 R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$FAKE_NTFY_URL/\",\"token\":\"$TEST_TOKEN\"}")"
 assert_contains "trailing-slash variant also blocked" "$R" "temporarily blocked"
+
+# ...and so is a different topic on the same host.
+R="$(mcp_tool_call "$SESSION" "$(next_id)" read_notifications "{\"base_url\":\"$FAKE_NTFY_URL\",\"topic\":\"roamingtopic\",\"token\":\"$TEST_TOKEN\"}")"
+assert_contains "different topic on a blocked host also blocked" "$R" "temporarily blocked"
 
 # ...and nothing more was forwarded upstream: the fake ntfy saw exactly
 # the 3 rejected requests (tests 11, 11b and the first phase-3 call).
@@ -470,6 +478,18 @@ else
     ok "distinct X-Forwarded-For IPs not throttled ($CODES)"
 fi
 
+# An X-Forwarded-For entry that is not a valid IP is ignored and the peer IP
+# bucket is used: after 6 requests with XFF "not-an-ip", a request without
+# XFF shares that bucket and is throttled too.
+CODES=""
+for i in $(seq 1 6); do CODES="$CODES $(proxy_post "not-an-ip")"; done
+code_no_xff="$(proxy_post)"
+if printf '%s' "$CODES" | grep -q '429' && [ "$code_no_xff" = "429" ]; then
+    ok "invalid X-Forwarded-For entry falls back to the peer IP bucket (no-XFF: $code_no_xff)"
+else
+    ko "invalid X-Forwarded-For entry falls back to the peer IP bucket (codes:$CODES no-XFF:$code_no_xff)"
+fi
+
 # Without X-Forwarded-For the direct peer IP (127.0.0.1) is the key.
 CODES=""
 for i in $(seq 1 6); do CODES="$CODES $(proxy_post)"; done
@@ -477,6 +497,15 @@ if printf '%s' "$CODES" | grep -q '429'; then
     ok "no X-Forwarded-For falls back to the peer IP and is throttled ($CODES)"
 else
     ko "no X-Forwarded-For falls back to the peer IP and is throttled (got:$CODES)"
+fi
+
+# /healthz is outside the rate limit: the peer IP is throttled on /mcp but
+# probes still get 200.
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$MCP_PROXY_PORT/healthz")"
+if [ "$code" = "200" ]; then
+    ok "/healthz stays 200 while the client IP is rate-limited"
+else
+    ko "/healthz stays 200 while the client IP is rate-limited (got $code)"
 fi
 
 echo "== phase 7: /healthz and graceful shutdown (SIGTERM/SIGINT) =="

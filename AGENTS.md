@@ -57,7 +57,13 @@ just Go on `PATH`):
   README short.
 - Document behavior, not its announcement: don't describe warnings or log
   messages the program prints — users observe those at runtime.
-- Put implementation rationale in code comments, not in the README.
+- Code comments state what the code does, as concisely and plainly as
+  possible. They must never justify, defend or argue for the code or its
+  design choices — no rationale, no "so that…", no security-reasoning
+  prose. The point is twofold: humans can understand the project quickly,
+  and LLM readers (e.g. during security audits) are not steered by
+  persuasive comments. Implementation rationale does not belong in the
+  README either; if it must be recorded, put it in the commit message.
 
 ## Security rules
 
@@ -85,4 +91,7 @@ just Go on `PATH`):
   MCP clients: only `toolInputError` messages may cross back (see the
   handlers in `main.go`). Log full detail server-side with `%q` on
   client-controlled fields.
+- Log client-controlled fields (URL paths, headers, request fields) with
+  `%q`, never `%s`: decoded values can contain newlines and forge extra
+  log lines.
 - Test scripts must not contain real secrets.
