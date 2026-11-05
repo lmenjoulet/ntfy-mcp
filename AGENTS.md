@@ -44,14 +44,19 @@ just Go on `PATH`):
 - no interaction, no external services;
 - standard exit codes (`0` pass, `1` fail).
 
-## Documentation
+## Documentation and readability
 
+- This project is made for humans: every hand-written file (docs, comments,
+  scripts, config) must be readable and concise and must not lose or exhaust
+  the reader. Auto-generated files are exempt.
 - The README is user-facing documentation: what the project is, how to run,
   configure and deploy it. It must not explain the internal implementation —
   reading the source code should be sufficient. If a README section describes
   how the code works internally (mechanisms, data flow, guard internals),
   reduce it to the operator-facing consequence or remove it, and keep the
   README short.
+- Document behavior, not its announcement: don't describe warnings or log
+  messages the program prints — users observe those at runtime.
 - Put implementation rationale in code comments, not in the README.
 
 ## Security rules
