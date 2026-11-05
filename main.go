@@ -28,7 +28,7 @@
 //	MCP_NTFY_ALLOW_PRIVATE_UPSTREAM  When "1", upstream connections to
 //	                      private/loopback/link-local IPs are allowed (for a
 //	                      self-hosted ntfy on the local network; default: "0",
-//	                      such IPs are refused at dial time, anti-SSRF)
+//	                      such IPs are refused at dial time)
 //	MCP_NTFY_CLIENT_RATE_LIMIT  Max MCP requests per client IP within
 //	                      MCP_NTFY_RATE_LIMIT_WINDOW seconds (default: 120;
 //	                      0 disables; over the limit -> HTTP 429)
@@ -95,14 +95,13 @@ const (
 	guardMaxEntries  = 10000   // cap on tracked targets / client IPs in the guards
 )
 
-// httpClient is shared by all requests so TCP connections are reused.
+// httpClient is shared by all upstream requests.
 var httpClient *http.Client
 
 // newHTTPClient builds the shared upstream client. Unless
 // allowPrivateUpstream is set, the dialer refuses loopback, private,
-// link-local (cloud metadata included), CGNAT, multicast and
-// unspecified IPs, validating the resolved address and pinning the
-// connection to it so DNS rebinding cannot bypass the check.
+// link-local, CGNAT, multicast and unspecified IPs, and dials the
+// validated address directly.
 func newHTTPClient(allowPrivateUpstream bool) *http.Client {
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	return &http.Client{
@@ -154,16 +153,15 @@ func isBlockedUpstreamIP(ip net.IP) bool {
 	if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
 		return true // CGNAT 100.64.0.0/10
 	}
-	// NAT64/464XLAT well-known prefix 64:ff9b::/96 can translate to
-	// internal IPv4 destinations on some networks.
+	// NAT64/464XLAT well-known prefix 64:ff9b::/96.
 	if ip16 := ip.To16(); ip16 != nil && ip16[0] == 0x00 && ip16[1] == 0x64 && ip16[2] == 0xff && ip16[3] == 0x9b {
 		return true
 	}
 	return false
 }
 
-// toolInputError is safe to return to the MCP client: it only describes
-// the client's own input. Any other error stays server-side.
+// toolInputError marks an error whose message may be returned to the MCP
+// client; any other error stays server-side.
 type toolInputError struct{ msg string }
 
 func (e *toolInputError) Error() string { return e.msg }
@@ -471,21 +469,18 @@ func parseTrustedProxies(s string) ([]netip.Prefix, error) {
 	return out, nil
 }
 
-// topicRe is the charset ntfy accepts; it also blocks path or query
-// injection into the upstream URL.
+// topicRe is the charset ntfy accepts for a topic.
 var topicRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 // delayRe is the charset ntfy accepts in the Delay header (relative
 // durations like "30min" or absolute timestamps like "2025-12-31 18:00").
 var delayRe = regexp.MustCompile(`^[0-9A-Za-z ,.:+-]{1,64}$`)
 
-// emailRe is a pragmatic email check for the Email (forward) header.
+// emailRe matches a plain address for the Email (forward) header.
 var emailRe = regexp.MustCompile(`^[^@\s]{1,64}@[^@\s]{1,190}\.[^@\s]{1,63}$`)
 
 // validatePublicURL checks that raw is an absolute http(s) URL without
-// credentials. Used for the click and icon fields: a notification must not
-// carry a javascript: or other dangerous scheme that a client app could
-// execute when the user interacts with it.
+// credentials, for the click and icon fields.
 func validatePublicURL(field, raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil ||
@@ -696,18 +691,29 @@ func parseArgs[T any](request mcp.CallToolRequest) (T, error) {
 	var args T
 	raw, err := json.Marshal(request.GetArguments())
 	if err != nil {
-		return args, fmt.Errorf("error reading arguments: %w", err)
+		return args, &toolInputError{fmt.Sprintf("invalid arguments: %v", err)}
 	}
 	if err := json.Unmarshal(raw, &args); err != nil {
-		return args, fmt.Errorf("error decoding arguments: %w", err)
+		return args, &toolInputError{fmt.Sprintf("invalid arguments: %v", err)}
 	}
 	return args, nil
 }
 
+// toolErrorResult maps an error to an MCP tool result: toolInputError
+// messages reach the client, any other error is logged server-side and
+// replaced by a generic message.
+func toolErrorResult(err error, generic string) *mcp.CallToolResult {
+	var ie *toolInputError
+	if errors.As(err, &ie) {
+		return mcp.NewToolResultError(ie.Error())
+	}
+	log.Printf("ERROR: %v", err)
+	return mcp.NewToolResultError(generic)
+}
+
 func (c config) publish(ctx context.Context, args notificationArgs) error {
 
-	// Applies defaults and the anti-exfiltration rule: a custom base_url
-	// needs its own token, or the server token would be sent to it.
+	// Applies defaults; a custom base_url needs its own token in the request.
 	baseURL, token, topic, err := c.resolveTarget(args.BaseURL, args.Token, args.Topic)
 	if err != nil {
 		return err
@@ -818,8 +824,7 @@ func (c config) publish(ctx context.Context, args notificationArgs) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		// The upstream body is logged server-side only, never returned
-		// to the MCP client.
+		// The upstream body stays server-side.
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		log.Printf("ERROR ntfy response body: %q", strings.TrimSpace(string(body)))
 		return fmt.Errorf("ntfy responded with status code %d", resp.StatusCode)
@@ -870,9 +875,8 @@ type ntfyNotification struct {
 	Markdown bool     `json:"markdown,omitempty"`
 }
 
-// resolveTarget applies server-side defaults. A custom base_url requires
-// a request token (anti-exfiltration), a valid http(s) URL and a valid
-// topic charset.
+// resolveTarget applies server-side defaults: a custom base_url requires
+// a request token, a valid http(s) URL and a valid topic.
 func (c config) resolveTarget(baseURL, token, topic string) (string, string, string, error) {
 	if baseURL == "" {
 		baseURL = c.BaseURL
@@ -900,8 +904,8 @@ func (c config) resolveTarget(baseURL, token, topic string) (string, string, str
 	return baseURL, token, topic, nil
 }
 
-// fetch returns the cached notifications of a topic, using poll=1 so the
-// server answers immediately instead of streaming new ones.
+// fetch returns the cached notifications of a topic; poll=1 makes the
+// server answer immediately instead of streaming new ones.
 func (c config) fetch(ctx context.Context, args readArgs) ([]ntfyNotification, error) {
 	baseURL, token, topic, err := c.resolveTarget(args.BaseURL, args.Token, args.Topic)
 	if err != nil {
@@ -1069,11 +1073,10 @@ func notificationHandler(cfg config) server.ToolHandlerFunc {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args, err := parseArgs[notificationArgs](request)
 		if err != nil {
-			log.Printf("ERROR: %v", err)
-			return nil, err
+			return toolErrorResult(err, "invalid request"), nil
 		}
 
-		// Log with the token redacted; %q on client fields prevents log forging.
+		// Log the request with the token redacted and %q on client fields.
 		logged := args
 		if cfg.UnsafeLogs != "1" {
 			logged.Token = "[redacted]"
@@ -1083,16 +1086,11 @@ func notificationHandler(cfg config) server.ToolHandlerFunc {
 
 		if strings.TrimSpace(args.Message) == "" {
 			log.Print("ERROR: message parameter is empty")
-			return nil, fmt.Errorf("message parameter cannot be empty")
+			return mcp.NewToolResultError("message parameter cannot be empty"), nil
 		}
 
 		if err := cfg.publish(ctx, args); err != nil {
-			log.Printf("ERROR publishing failed: %v", err)
-			var ie *toolInputError
-			if errors.As(err, &ie) {
-				return mcp.NewToolResultError(ie.Error()), nil
-			}
-			return mcp.NewToolResultError("failed to send the notification to the upstream ntfy server"), nil
+			return toolErrorResult(err, "failed to send the notification to the upstream ntfy server"), nil
 		}
 		log.Printf("notification published successfully")
 		return mcp.NewToolResultText("Notification sent successfully."), nil
@@ -1131,8 +1129,7 @@ func readHandler(cfg config) server.ToolHandlerFunc {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args, err := parseArgs[readArgs](request)
 		if err != nil {
-			log.Printf("ERROR: %v", err)
-			return nil, err
+			return toolErrorResult(err, "invalid request"), nil
 		}
 
 		// Same log redaction as send_notification.
@@ -1145,12 +1142,7 @@ func readHandler(cfg config) server.ToolHandlerFunc {
 
 		notifs, err := cfg.fetch(ctx, args)
 		if err != nil {
-			log.Printf("ERROR reading failed: %v", err)
-			var ie *toolInputError
-			if errors.As(err, &ie) {
-				return mcp.NewToolResultError(ie.Error()), nil
-			}
-			return mcp.NewToolResultError("failed to read notifications from the upstream ntfy server"), nil
+			return toolErrorResult(err, "failed to read notifications from the upstream ntfy server"), nil
 		}
 		if len(notifs) == 0 {
 			log.Printf("no notifications found")
@@ -1159,7 +1151,7 @@ func readHandler(cfg config) server.ToolHandlerFunc {
 		out, err := json.MarshalIndent(notifs, "", "  ")
 		if err != nil {
 			log.Printf("ERROR encoding notifications: %v", err)
-			return nil, fmt.Errorf("error encoding notifications: %w", err)
+			return mcp.NewToolResultError("failed to encode the notifications"), nil
 		}
 		log.Printf("returning %d notification(s)", len(notifs))
 		return mcp.NewToolResultText(string(out)), nil
@@ -1210,9 +1202,9 @@ func main() {
 
 	transport := server.NewStreamableHTTPServer(srv)
 
-	// /mcp is rate-limited per client IP and its body capped; /healthz stays
-	// outside the rate limit so probes are never throttled. Both endpoints
-	// require the Bearer token when MCP_NTFY_CLIENT_TOKEN is set.
+	// /mcp is rate-limited per client IP and its body capped; /healthz is
+	// not rate-limited. Both endpoints require the Bearer token when
+	// MCP_NTFY_CLIENT_TOKEN is set.
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", withRateLimit(cfg.ClientLimiter, cfg.TrustedProxies, transport))
 	mux.HandleFunc("/healthz", healthzHandler)
@@ -1221,7 +1213,7 @@ func main() {
 	httpSrv := &http.Server{
 		Addr: addr,
 		Handler: withClientAuth(cfg.ClientToken, cfg.AuthFailLimiter, cfg.TrustedProxies, mux),
-		// Timeouts so stalled clients cannot hold connections open.
+		// Server timeouts.
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
