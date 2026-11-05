@@ -136,6 +136,8 @@ export MCP_NTFY_CLIENT_TOKEN=another_long_random_secret
 
 When `MCP_NTFY_CLIENT_TOKEN` is empty (the default), no client authentication is performed — keep the server on loopback or behind an authenticated reverse proxy in that case.
 
+The server itself speaks plain HTTP. When exposing it beyond loopback, always put it behind a **TLS-terminating reverse proxy** (nginx, Caddy, Traefik, …) so the `MCP_NTFY_CLIENT_TOKEN` Bearer header and the notification content are never sent in cleartext on the network.
+
 ### Upstream rate limiting (anti proxy-DoS)
 
 In the public-server regime, a client could otherwise use this MCP server as a proxy to flood a third-party ntfy server (e.g. by sending many requests that the target rejects with `401`). To prevent that, the server keeps an **upstream guard**: when a target base URL accumulates `MCP_NTFY_RATE_LIMIT_FAILURES` rejection responses (`401`/`403`/`429`) within `MCP_NTFY_RATE_LIMIT_WINDOW` seconds, that target is blocked for `MCP_NTFY_RATE_LIMIT_BLOCK` seconds and requests to it are refused locally, **without any upstream call**.
@@ -176,6 +178,21 @@ nix build
 The nix flake file has additional build options as it is intended for release builds.
 
 **TODO** Add the server on common MCP registries
+
+### Security hardening TODOs
+
+From a pre-production security audit (server will be exposed on an Internet-connected host):
+
+- Restrict the `base_url` tool argument to the `http`/`https` schemes (first step against SSRF; ideally also block private/loopback/link-local/metadata IPs, checked at dial time to resist DNS rebinding).
+- DoS hardening of the MCP HTTP server: set `ReadHeaderTimeout`/`ReadTimeout`/`WriteTimeout`/`IdleTimeout` on `http.Server`, cap request body size, cap `message` size, limit concurrency of upstream calls, and enforce a default/max `limit` in `read_notifications` (currently unbounded when `limit=0`).
+- Never return the upstream ntfy response body to the MCP client (only the HTTP status); log it server-side only.
+- Validate the `topic` argument (charset, e.g. `^[A-Za-z0-9_-]+$`) or `url.PathEscape` it before building the upstream URL (`?`, `#`, `../` currently inject into the request URL).
+- Cap the size of the upstream-guard maps (`rejections`/`blockedUntil`, keyed by client-supplied `base_url`) and add a general request rate limit — the guard only counts upstream 401/403/429 rejections, successful spam is unlimited.
+- Client auth: throttle repeated `401`s (online brute force of `MCP_NTFY_CLIENT_TOKEN`) and compare hashes instead of raw lengths in the constant-time comparison. TLS itself is delegated to a reverse proxy (see above).
+- Warn at startup when `MCP_NTFY_UNSAFE_LOGS=1` is combined with a non-loopback `MCP_NTFY_ADDR` (cleartext tokens in logs on an exposed host); keep the flag usable for production debugging.
+- Run `govulncheck ./...` in CI (and enable Dependabot/Renovate) to track dependency vulnerabilities (mcp-go, …).
+- NixOS module: add more systemd hardening (`CapabilityBoundingSet`, `RestrictAddressFamilies`, `SystemCallFilter`, `MemoryDenyWriteExecute`, `ProtectKernel*`, `PrivateDevices`, …) and warn when `address` is non-loopback without `clientTokenFile`.
+- Return generic error messages to MCP clients; keep internal details (DNS errors, upstream bodies) in server logs only.
 
 ## License
 
