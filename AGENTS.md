@@ -44,6 +44,16 @@ just Go on `PATH`):
 - no interaction, no external services;
 - standard exit codes (`0` pass, `1` fail).
 
+## Documentation
+
+- The README is user-facing documentation: what the project is, how to run,
+  configure and deploy it. It must not explain the internal implementation —
+  reading the source code should be sufficient. If a README section describes
+  how the code works internally (mechanisms, data flow, guard internals),
+  reduce it to the operator-facing consequence or remove it, and keep the
+  README short.
+- Put implementation rationale in code comments, not in the README.
+
 ## Security rules
 
 - Never log tokens in cleartext. Logs redact tokens by default;
