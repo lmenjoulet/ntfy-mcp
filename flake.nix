@@ -38,6 +38,9 @@
   default = pkgs.mkShell {
     packages = with pkgs; [
       go
+      # scripts/run-tests.sh parses MCP responses with jq; CI images
+      # (GitHub Actions) ship it preinstalled, the dev shell provides it.
+      jq
     ];
 
     shellHook = ''
