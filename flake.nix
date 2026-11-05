@@ -27,6 +27,7 @@
     vendorHash = "sha256-MUVW6/ZiQ5h8AUVbu/yzVhUEGvA5NoxdAYH50skkak4=";
     meta = with pkgs.lib; {
       description = "Serveur MCP d'envoi de notifications ntfy";
+      license = licenses.gpl3;
       mainProgram = "ntfy-mcp";
       platforms = supportedSystems;
     };

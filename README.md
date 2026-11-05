@@ -175,5 +175,10 @@ nix build
 
 The nix flake file has additional build options as it is intended for release builds.
 
-**TODO** Add a licence (GPLv3)
 **TODO** Add the server on common MCP registries
+
+## License
+
+This project is licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later) — see [LICENSE](LICENSE) for the full text of version 3.
+
+Copyright (C) 2026 Loup Menjoulet
