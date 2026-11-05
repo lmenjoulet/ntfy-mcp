@@ -55,6 +55,7 @@ Set `MCP_NTFY_TRANSPORT=stdio` to serve MCP over stdin/stdout instead of HTTP �
 | `MCP_NTFY_CLIENT_RATE_LIMIT` | `120` | Max requests per client IP per window (`429` over); `0` disables |
 | `MCP_NTFY_AUTH_FAILURE_LIMIT` | `10` | Max failed authentications per IP per window (`429` over) |
 | `MCP_NTFY_MAX_CONCURRENT_UPSTREAM` | `32` | Max concurrent upstream calls |
+| `MCP_NTFY_TRUSTED_PROXIES` | *empty* | Comma-separated proxy IPs/CIDRs whose `X-Forwarded-For` is trusted for the per-client rate limits (set it when the server sits behind a reverse proxy you control) |
 | `MCP_NTFY_ALLOW_PRIVATE_UPSTREAM` | `0` | `1` allows private/loopback upstream IPs (LAN-hosted ntfy only) |
 | `MCP_NTFY_UNSAFE_LOGS` | `0` | `1` logs tokens in cleartext (debug only) |
 
@@ -75,25 +76,43 @@ The flake exposes a NixOS module:
 }
 ```
 
+Example configuration with an nginx reverse proxy.
 ```nix
-services.ntfy-mcp = {
-  enable = true;
-  ntfyUrl = "https://ntfy.sh";
-  ntfyTopic = "my-topic";
-  tokenFile = "/run/secrets/ntfy-mcp-token";               # one NTFY_TOKEN=... line
-  # clientTokenFile = "/run/secrets/ntfy-mcp-client-token"; # one MCP_NTFY_CLIENT_TOKEN=... line
-  address = "127.0.0.1";
-  port = 12120;
-  # allowPrivateUpstream = true; # self-hosted ntfy on the LAN only
-};
-```
+{
+  services.ntfy-mcp = {
+    enable = true;
+    address = "127.0.0.1";   # loopback only; nginx exposes it
+    port = 12120;
+    ntfyUrl = "https://ntfy.sh";
+    ntfyTopic = "my-topic";
+    tokenFile = "/run/secrets/ntfy-mcp-token";               # one NTFY_TOKEN=... line
+    clientTokenFile = "/run/secrets/ntfy-mcp-client-token";  # one MCP_NTFY_CLIENT_TOKEN=... line
+    trustedProxies = [ "127.0.0.1/32" ]; # trust nginx's X-Forwarded-For for per-client rate limits
+    # allowPrivateUpstream = true;      # self-hosted ntfy on the LAN only
+  };
 
-The service runs hardened under systemd (DynamicUser, `NoNewPrivileges`, `ProtectSystem=strict`, syscall filter, …).
+  services.nginx = {
+    enable = true;
+    virtualHosts."ntfy-mcp.example.com" = {
+      forceSSL = true;
+      locations."/mcp" = {
+        proxyPass = "http://127.0.0.1:12120";
+        extraConfig = ''
+          proxy_http_version 1.1;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_buffering off;
+          proxy_read_timeout 300s;
+        '';
+      };
+    };
+  };
+}
+```
 
 ## MCP capabilities
 
 - Send notifications
-- Read cached notifications from a topic (`read_notifications`: optional `since`, `limit`, `cached_only`)
+- Read cached notifications from a topic 
 
 ## Security considerations
 
@@ -106,7 +125,30 @@ The server supports two regimes, depending on whether `NTFY_TOKEN` is set:
 
 ### Exposing the server
 
-The server listens on loopback by default and speaks plain HTTP. Expose it beyond loopback only behind a **TLS-terminating reverse proxy** (nginx, Caddy, Traefik, …) and set `MCP_NTFY_CLIENT_TOKEN`: every MCP request must then carry it as `Authorization: Bearer <token>` and is rejected with `401` otherwise, so unauthenticated users cannot spam notifications through your topic.
+The server listens on loopback by default and speaks plain HTTP. Expose it beyond loopback only behind a **TLS-terminating reverse proxy** and set `MCP_NTFY_CLIENT_TOKEN`: every MCP request must then carry it as `Authorization: Bearer <token>` and is rejected with `401` otherwise, so unauthenticated users cannot spam notifications through your topic.
+
+nginx example :
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name ntfy-mcp.example.com;
+
+    location /mcp {
+        proxy_pass http://127.0.0.1:12120;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        # forwarded so the server can rate-limit per real client IP
+        # (requires MCP_NTFY_TRUSTED_PROXIES, see below):
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # MCP streamable HTTP uses long-lived SSE responses:
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+    }
+}
+```
+
+With a proxy on the same host, also set `MCP_NTFY_TRUSTED_PROXIES=127.0.0.1/32` so the per-client rate limits use the real client IP from `X-Forwarded-For` instead of the proxy's address.
 
 ### Built-in protections
 
