@@ -66,10 +66,12 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -1168,6 +1170,18 @@ func readHandler(cfg config) server.ToolHandlerFunc {
 	}
 }
 
+// healthzHandler answers liveness/readiness probes with a static 200.
+// It is registered on the same mux as /mcp, so when MCP_NTFY_CLIENT_TOKEN
+// is set it requires the Bearer token like every other endpoint.
+func healthzHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprintln(w, "ok")
+}
+
 func main() {
 	log.SetPrefix("[ntfy-mcp] ")
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
@@ -1200,10 +1214,11 @@ func main() {
 
 	transport := server.NewStreamableHTTPServer(srv)
 
-	// Wrap the MCP endpoint with the middlewares: rate limit first, then
+	// Wrap the endpoints with the middlewares: rate limit first, then
 	// client auth (a no-op when MCP_NTFY_CLIENT_TOKEN is not set).
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", transport)
+	mux.HandleFunc("/healthz", healthzHandler)
 
 	addr := fmt.Sprintf("%s:%d", cfg.MCPAddr, cfg.MCPPort)
 	httpSrv := &http.Server{
@@ -1217,8 +1232,28 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
-	log.Printf("server v.%s listening on %s (path /mcp)", Version, addr)
-	if err := httpSrv.ListenAndServe(); err != nil {
-		log.Fatalf("fatal error: %v", err)
+	// SIGTERM/SIGINT trigger a graceful shutdown: stop accepting new
+	// connections, let in-flight requests finish (bounded by the timeout
+	// below), then exit 0.
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- httpSrv.ListenAndServe() }()
+
+	log.Printf("server v.%s listening on %s (MCP path /mcp, health endpoint /healthz)", Version, addr)
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("fatal error: %v", err)
+		}
+	case <-sigCtx.Done():
+		log.Print("shutdown signal received: closing listeners, draining in-flight requests")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			log.Fatalf("error during graceful shutdown: %v", err)
+		}
+		log.Print("graceful shutdown complete")
 	}
 }

@@ -18,6 +18,8 @@ export NTFY_TOKEN=your_token_here
 
 By default the server listens on loopback only, at `http://127.0.0.1:12120/mcp`. Set `MCP_NTFY_ADDR` to expose it — behind an authenticated reverse proxy (see [Security](#security-considerations)).
 
+The HTTP transport also serves `GET /healthz` (answers `200 ok`), for liveness/readiness probes. When `MCP_NTFY_CLIENT_TOKEN` is set, `/healthz` requires the Bearer token like every other endpoint — pass it via the probe's `httpHeaders`. On SIGTERM/SIGINT the server stops accepting new connections, drains in-flight requests (up to 10 s) and exits 0, so it is safe to run under systemd, Kubernetes or Docker.
+
 ### stdio transport
 
 Set `MCP_NTFY_TRANSPORT=stdio` to serve MCP over stdin/stdout instead of HTTP — the usual way MCP clients spawn a local server. In stdio mode `MCP_NTFY_ADDR`, `MCP_NTFY_PORT` and `MCP_NTFY_CLIENT_TOKEN` have no effect.
@@ -172,7 +174,6 @@ nix build  # release build via the flake
 
 ## TODO
 
-- Graceful shutdown on SIGTERM/SIGINT and a `/healthz` health endpoint
 - Add the server to common MCP registries
 
 ## License
