@@ -71,29 +71,23 @@ import (
 
 var Version = "dev"
 
-// Limits applied to protect the server itself (anti-DoS).
+// Size and count limits.
 const (
-	maxMCPBodyBytes  = 1 << 20  // cap on an MCP JSON-RPC request body
-	maxMessageBytes  = 4096     // ntfy server limit for a notification body
-	maxFetchBytes    = 4 << 20  // cap on total bytes read from an upstream stream
+	maxMCPBodyBytes  = 1 << 20  // cap on an MCP request body
+	maxMessageBytes  = 4096     // ntfy limit for a notification body
+	maxFetchBytes    = 4 << 20  // cap on bytes read from an upstream stream
 	defaultReadLimit = 100      // read_notifications limit when omitted
 	maxReadLimit     = 1000     // hard cap on read_notifications limit
 )
 
-// httpClient is shared across all requests: its TCP connections are
-// reused between calls (keep-alive), avoiding a full TLS handshake per
-// notification. It is built by newHTTPClient once the config is loaded.
+// httpClient is shared by all requests so TCP connections are reused.
 var httpClient *http.Client
 
-// newHTTPClient builds the shared upstream HTTP client. Unless
-// allowPrivateUpstream is set (MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1, meant
-// for a self-hosted ntfy on a private network), every dialed address is
-// checked: loopback, private, link-local (which includes the cloud
-// metadata endpoint 169.254.169.254), CGNAT, multicast and unspecified
-// IPs are refused. The check runs at dial time on the resolved
-// addresses and the connection is pinned to a validated IP, so a DNS
-// rebinding attack cannot bypass it (TLS ServerName still comes from
-// the request URL, so certificate verification is unaffected).
+// newHTTPClient builds the shared upstream client. Unless
+// allowPrivateUpstream is set, the dialer refuses loopback, private,
+// link-local (cloud metadata included), CGNAT, multicast and
+// unspecified IPs, validating the resolved address and pinning the
+// connection to it so DNS rebinding cannot bypass the check.
 func newHTTPClient(allowPrivateUpstream bool) *http.Client {
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	return &http.Client{
@@ -107,6 +101,7 @@ func newHTTPClient(allowPrivateUpstream bool) *http.Client {
 	}
 }
 
+// safeDialContext returns a DialContext that validates the target IP first.
 func safeDialContext(dialer *net.Dialer, allowPrivate bool) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
@@ -135,6 +130,7 @@ func safeDialContext(dialer *net.Dialer, allowPrivate bool) func(ctx context.Con
 	}
 }
 
+// isBlockedUpstreamIP reports whether ip is off-limits as an upstream target.
 func isBlockedUpstreamIP(ip net.IP) bool {
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsUnspecified() || ip.IsMulticast() || ip.IsInterfaceLocalMulticast() {
@@ -146,16 +142,13 @@ func isBlockedUpstreamIP(ip net.IP) bool {
 	return false
 }
 
-// toolInputError marks an error whose message is safe to return to the
-// MCP client because it only describes the client's own input (bad
-// base_url, bad topic, blocked target, ...). Any other error is logged
-// server-side with full detail and replaced by a generic message, so
-// internal details never leak to MCP clients.
+// toolInputError is safe to return to the MCP client: it only describes
+// the client's own input. Any other error stays server-side.
 type toolInputError struct{ msg string }
 
 func (e *toolInputError) Error() string { return e.msg }
 
-// config holds the configuration loaded once at startup.
+// config is loaded once at startup.
 type config struct {
 	BaseURL              string // Base URL, already normalized (no trailing slash)
 	Topic                string
@@ -172,23 +165,18 @@ type config struct {
 	upstreamSem          chan struct{} // bounds concurrent upstream calls
 }
 
-// upstreamGuard protects third-party ntfy servers from being flooded
-// through this MCP server used as a proxy: when a target base URL
-// accumulates too many rejection responses (HTTP 401/403/429) within a
-// sliding window, that target is temporarily blocked and requests to it
-// are refused locally, without any upstream call.
-//
-// The guard is keyed by target base URL only (not by request token), so a
-// client cannot evade the block by rotating tokens against the same
-// target.
+// upstreamGuard temporarily blocks a target base URL that keeps getting
+// 401/403/429 upstream, so this server cannot be used to flood a
+// third-party ntfy. Keyed by base URL only: rotating tokens does not
+// evade a block.
 type upstreamGuard struct {
 	mu           sync.Mutex
 	maxFailures  int
 	window       time.Duration
 	blockFor     time.Duration
-	maxEntries   int                          // cap on map sizes: targets are client-supplied, the maps must not grow without bound
-	rejections   map[string][]time.Time // target -> timestamps of recent upstream rejections
-	blockedUntil map[string]time.Time   // target -> end of the current block
+	maxEntries   int                          // caps map size: targets are client-supplied
+	rejections   map[string][]time.Time // target -> recent rejection times
+	blockedUntil map[string]time.Time   // target -> end of the block
 }
 
 func newUpstreamGuard(maxFailures, windowSec, blockSec int) *upstreamGuard {
@@ -205,9 +193,7 @@ func newUpstreamGuard(maxFailures, windowSec, blockSec int) *upstreamGuard {
 	}
 }
 
-// evictIfNeeded drops the oldest entries once a map exceeds maxEntries,
-// so a client spraying unique base_url values cannot grow the guard's
-// maps without bound.
+// evictIfNeeded drops the oldest entry once a map exceeds maxEntries.
 func (g *upstreamGuard) evictIfNeeded() {
 	if len(g.rejections) > g.maxEntries {
 		oldestKey, oldest := "", time.Time{}
@@ -229,8 +215,7 @@ func (g *upstreamGuard) evictIfNeeded() {
 	}
 }
 
-// allow returns how long the target is still blocked; 0 means the request
-// may be forwarded upstream.
+// allow returns the remaining block time for target (0 = allowed).
 func (g *upstreamGuard) allow(target string) time.Duration {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -245,9 +230,8 @@ func (g *upstreamGuard) allow(target string) time.Duration {
 	return 0
 }
 
-// noteRejection records an upstream response status for the target and
-// blocks the target once maxFailures rejections (401/403/429) have been
-// seen within the sliding window. Other statuses are ignored.
+// noteRejection records an upstream status and blocks the target once
+// maxFailures rejections (401/403/429) land within the window.
 func (g *upstreamGuard) noteRejection(target string, status int) {
 	if status != http.StatusUnauthorized && status != http.StatusForbidden && status != http.StatusTooManyRequests {
 		return
@@ -272,8 +256,7 @@ func (g *upstreamGuard) noteRejection(target string, status int) {
 	g.evictIfNeeded()
 }
 
-// checkUpstreamAllowed refuses the request locally when the target is
-// currently blocked by the anti-DoS guard.
+// checkUpstreamAllowed refuses a blocked target before any upstream call.
 func (c config) checkUpstreamAllowed(baseURL string) error {
 	if c.Guard == nil {
 		return nil
@@ -287,9 +270,7 @@ func (c config) checkUpstreamAllowed(baseURL string) error {
 	return nil
 }
 
-// noteUpstreamStatus feeds the upstream response status to the anti-DoS
-// guard (no-op when the guard is disabled or the status is not a
-// rejection).
+// noteUpstreamStatus feeds an upstream response status to the guard.
 func (c config) noteUpstreamStatus(baseURL string, status int) {
 	if c.Guard == nil {
 		return
@@ -297,6 +278,7 @@ func (c config) noteUpstreamStatus(baseURL string, status int) {
 	c.Guard.noteRejection(baseURL, status)
 }
 
+// loadConfig reads the environment and validates the result.
 func loadConfig() (config, error) {
 	var cfg config
 
@@ -404,14 +386,11 @@ func isTruthy(v string) bool {
 	return v == "1" || strings.EqualFold(v, "true")
 }
 
-// topicRe restricts topic names to the charset ntfy accepts, so a topic
-// can never inject path segments ("../"), query ("?") or fragment ("#")
-// into the upstream URL built by string concatenation.
+// topicRe is the charset ntfy accepts; it also blocks path or query
+// injection into the upstream URL.
 var topicRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
-// validateBaseURL enforces the anti-SSRF first line: only absolute
-// http/https URLs without embedded credentials are accepted as upstream
-// targets.
+// validateBaseURL accepts only absolute http(s) URLs without credentials.
 func validateBaseURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil {
@@ -423,9 +402,7 @@ func validateBaseURL(raw string) error {
 	return nil
 }
 
-// isLoopbackAddr reports whether the configured listen address is
-// loopback (IP or resolvable hostname), used to warn when the server is
-// exposed beyond loopback without protection.
+// isLoopbackAddr reports whether the listen address is loopback.
 func isLoopbackAddr(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -450,8 +427,7 @@ func isLoopbackAddr(addr string) bool {
 	return true
 }
 
-// rateLimiter is a per-key sliding-window limiter. Keys are client IPs;
-// the map is capped so a flood of distinct keys cannot exhaust memory.
+// rateLimiter is a bounded per-key sliding-window counter.
 type rateLimiter struct {
 	mu         sync.Mutex
 	max        int
@@ -472,8 +448,7 @@ func newRateLimiter(max, windowSec, maxEntries int) *rateLimiter {
 	}
 }
 
-// allow records a hit for key and reports whether it is within the
-// limit (true) or over it (false).
+// allow records a hit for key and reports whether it is within the limit.
 func (l *rateLimiter) allow(key string) bool {
 	if l == nil {
 		return true
@@ -501,9 +476,7 @@ func (l *rateLimiter) allow(key string) bool {
 	return len(l.hits[key]) <= l.max
 }
 
-// clientIP extracts the IP of the direct peer. X-Forwarded-For is
-// deliberately not trusted: a client could spoof it to dodge the
-// per-IP limits.
+// clientIP returns the direct peer IP; X-Forwarded-For is not trusted (spoofable).
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -512,9 +485,7 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
-// withRateLimit caps the number of MCP requests per client IP within
-// the sliding window (HTTP 429 when over) and caps the request body
-// size, so neither slow nor huge requests can exhaust the server.
+// withRateLimit answers 429 past the per-IP limit and caps the request body.
 func withRateLimit(limiter *rateLimiter, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !limiter.allow(clientIP(r)) {
@@ -527,11 +498,8 @@ func withRateLimit(limiter *rateLimiter, next http.Handler) http.Handler {
 	})
 }
 
-// sameOrigin reports whether two raw base URLs point to the exact same
-// destination: identical scheme and host (case-insensitive, port included)
-// and identical path, with no userinfo component. Anything that fails to
-// parse, or that carries a userinfo (e.g. "https://host@evil/"), is
-// considered a different origin.
+// sameOrigin reports whether two base URLs share scheme, host and path;
+// unparseable URLs or userinfo count as a different origin.
 func sameOrigin(rawA, rawB string) bool {
 	a, err := url.Parse(strings.TrimRight(rawA, "/"))
 	if err != nil || a.User != nil || a.Scheme == "" || a.Host == "" {
@@ -546,16 +514,10 @@ func sameOrigin(rawA, rawB string) bool {
 		a.Path == b.Path
 }
 
-// withClientAuth wraps the MCP endpoint with a shared-secret check, so
-// that unauthenticated users cannot reach the tools (and spam the ntfy
-// topic) when the server is exposed beyond loopback. When secret is empty
-// the handler is returned unchanged: no client authentication.
-//
-// Clients must send "Authorization: Bearer <secret>". Both sides are
-// hashed (SHA-256) before a constant-time comparison, so neither the
-// secret's length nor its content leaks through timing. Repeated failed
-// attempts from one IP are throttled (HTTP 429) to slow online brute
-// force. The presented token is never logged.
+// withClientAuth requires "Authorization: Bearer <secret>" (an empty
+// secret disables the check). Both sides are hashed and compared in
+// constant time; failures are throttled per IP and the presented token
+// is never logged.
 func withClientAuth(secret string, failLimiter *rateLimiter, next http.Handler) http.Handler {
 	if secret == "" {
 		return next
@@ -573,7 +535,7 @@ func withClientAuth(secret string, failLimiter *rateLimiter, next http.Handler) 
 				return
 			}
 			log.Printf("REJECTED MCP request from %s to %s %s: missing or invalid client token", r.RemoteAddr, r.Method, r.URL.Path)
-			w.Header().Set("WWW-Authenticate", `Bearer realm="ntfy-mcp"`)
+			w.Header().Set("WWW-Authenticate", `Bearer realm=\"ntfy-mcp\"`)
 			http.Error(w, "unauthorized: a valid Bearer token is required", http.StatusUnauthorized)
 			return
 		}
@@ -581,7 +543,7 @@ func withClientAuth(secret string, failLimiter *rateLimiter, next http.Handler) 
 	})
 }
 
-// notificationArgs describes the parameters for the send_notification tool.
+// notificationArgs are the send_notification parameters.
 type notificationArgs struct {
 	BaseURL  string `json:"base_url,omitempty"`
 	Token    string `json:"token,omitempty"`
@@ -606,12 +568,8 @@ func parseArgs[T any](request mcp.CallToolRequest) (T, error) {
 
 func (c config) publish(ctx context.Context, args notificationArgs) error {
 
-	// Anti-exfiltration guard (shared with fetch): an agent-chosen
-	// base_url is only accepted when the request carries its own token.
-	// Otherwise the server's token could be sent to an arbitrary
-	// destination. Origins are compared as parsed URLs (scheme + host +
-	// path), never as raw strings, so look-alike spellings cannot slip
-	// through.
+	// Applies defaults and the anti-exfiltration rule: a custom base_url
+	// needs its own token, or the server token would be sent to it.
 	baseURL, token, topic, err := c.resolveTarget(args.BaseURL, args.Token, args.Topic)
 	if err != nil {
 		return err
@@ -638,8 +596,7 @@ func (c config) publish(ctx context.Context, args notificationArgs) error {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	// The token is never logged, unless MCP_NTFY_UNSAFE_LOGS=1 was set
-	// at startup (debugging only: logs are not a secret-safe place).
+	// Tokens are redacted from logs unless MCP_NTFY_UNSAFE_LOGS=1.
 	logToken := "provided=%t"
 	tokenArgs := any(token != "")
 	if c.UnsafeLogs == "1" {
@@ -665,7 +622,7 @@ func (c config) publish(ctx context.Context, args notificationArgs) error {
 		log.Printf("ERROR sending to ntfy: %q", err.Error())
 		var ie *toolInputError
 		if errors.As(err, &ie) {
-			return ie // e.g. dial-time refusal of a private/loopback target
+			return ie // dial-time refusal of a private/loopback target
 		}
 		return fmt.Errorf("error sending to ntfy: %w", err)
 	}
@@ -674,9 +631,8 @@ func (c config) publish(ctx context.Context, args notificationArgs) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		// The upstream body is logged server-side only: it is never
-		// returned to the MCP client (it could carry internal data when
-		// the target is not the expected ntfy server).
+		// The upstream body is logged server-side only, never returned
+		// to the MCP client.
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		log.Printf("ERROR ntfy response body: %q", strings.TrimSpace(string(body)))
 		return fmt.Errorf("ntfy responded with status code %d", resp.StatusCode)
@@ -685,8 +641,7 @@ func (c config) publish(ctx context.Context, args notificationArgs) error {
 	return nil
 }
 
-// acquireUpstreamSlot bounds the number of concurrent upstream calls so
-// a burst of tool calls cannot exhaust file descriptors or memory.
+// acquireUpstreamSlot bounds concurrent upstream calls.
 func (c config) acquireUpstreamSlot(ctx context.Context) error {
 	select {
 	case c.upstreamSem <- struct{}{}:
@@ -700,7 +655,7 @@ func (c config) releaseUpstreamSlot() {
 	<-c.upstreamSem
 }
 
-// readArgs describes the parameters for the read_notifications tool.
+// readArgs are the read_notifications parameters.
 type readArgs struct {
 	BaseURL    string `json:"base_url,omitempty"`
 	Token      string `json:"token,omitempty"`
@@ -710,8 +665,7 @@ type readArgs struct {
 	CachedOnly bool   `json:"cached_only,omitempty"`
 }
 
-// ntfyNotification mirrors the JSON objects returned by the ntfy server
-// when reading a topic (one JSON object per line).
+// ntfyNotification is one JSON object from the ntfy stream (one per line).
 type ntfyNotification struct {
 	ID       string   `json:"id"`
 	Time     int64    `json:"time"`
@@ -726,9 +680,9 @@ type ntfyNotification struct {
 	Icon     string   `json:"icon,omitempty"`
 }
 
-// resolveTarget applies the server-side defaults and enforces the same
-// anti-exfiltration guard as publish: an agent-chosen base_url is only
-// accepted when the request carries its own token.
+// resolveTarget applies server-side defaults. A custom base_url requires
+// a request token (anti-exfiltration), a valid http(s) URL and a valid
+// topic charset.
 func (c config) resolveTarget(baseURL, token, topic string) (string, string, string, error) {
 	if baseURL == "" {
 		baseURL = c.BaseURL
@@ -737,8 +691,7 @@ func (c config) resolveTarget(baseURL, token, topic string) (string, string, str
 		log.Printf("REJECTED custom base_url %q without request token: server token must not leave to an agent-chosen URL", baseURL)
 		return "", "", "", &toolInputError{"custom base_url requires a token in the request"}
 	}
-	// Anti-SSRF first line: only absolute http(s) URLs without embedded
-	// credentials may be used as upstream targets.
+	// Only absolute http(s) URLs without embedded credentials.
 	if err := validateBaseURL(baseURL); err != nil {
 		log.Printf("REJECTED invalid base_url %q: %v", baseURL, err)
 		return "", "", "", err
@@ -756,9 +709,8 @@ func (c config) resolveTarget(baseURL, token, topic string) (string, string, str
 	return baseURL, token, topic, nil
 }
 
-// fetch retrieves cached notifications from a topic. It uses poll=1 so the
-// server answers immediately with the messages it has in cache and closes
-// the connection, instead of streaming new ones.
+// fetch returns the cached notifications of a topic, using poll=1 so the
+// server answers immediately instead of streaming new ones.
 func (c config) fetch(ctx context.Context, args readArgs) ([]ntfyNotification, error) {
 	baseURL, token, topic, err := c.resolveTarget(args.BaseURL, args.Token, args.Topic)
 	if err != nil {
@@ -772,9 +724,7 @@ func (c config) fetch(ctx context.Context, args readArgs) ([]ntfyNotification, e
 	}
 	defer c.releaseUpstreamSlot()
 
-	// Bound the number of notifications read: a default when omitted,
-	// a hard cap always, plus a cap on the total bytes read, so a
-	// malicious upstream cannot exhaust memory with a huge stream.
+	// Default and cap the limit, and cap the total bytes read.
 	limit := args.Limit
 	if limit <= 0 {
 		limit = defaultReadLimit
@@ -803,8 +753,8 @@ func (c config) fetch(ctx context.Context, args readArgs) ([]ntfyNotification, e
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	// Same logging policy as publish: the token is redacted unless
-	// MCP_NTFY_UNSAFE_LOGS=1 was set at startup.
+	// Same log redaction as publish: tokens stay out of the logs unless
+	// MCP_NTFY_UNSAFE_LOGS=1.
 	logToken := "provided=%t"
 	tokenArgs := any(token != "")
 	if c.UnsafeLogs == "1" {
@@ -819,7 +769,7 @@ func (c config) fetch(ctx context.Context, args readArgs) ([]ntfyNotification, e
 		log.Printf("ERROR reading from ntfy: %q", err.Error())
 		var ie *toolInputError
 		if errors.As(err, &ie) {
-			return nil, ie // e.g. dial-time refusal of a private/loopback target
+			return nil, ie // dial-time refusal of a private/loopback target
 		}
 		return nil, fmt.Errorf("error reading from ntfy: %w", err)
 	}
@@ -834,8 +784,7 @@ func (c config) fetch(ctx context.Context, args readArgs) ([]ntfyNotification, e
 		return nil, fmt.Errorf("ntfy responded with status code %d", resp.StatusCode)
 	}
 
-	// ntfy streams one JSON object per line; parse them as they arrive
-	// and stop early once the limit is reached or the byte cap is hit.
+	// One JSON object per line; stop at the limit or the byte cap.
 	var notifs []ntfyNotification
 	var total int64
 	scanner := bufio.NewScanner(&countingReader{r: resp.Body, n: &total})
@@ -866,7 +815,7 @@ func (c config) fetch(ctx context.Context, args readArgs) ([]ntfyNotification, e
 	return notifs, nil
 }
 
-// countingReader tracks how many bytes were read from an upstream stream.
+// countingReader counts the bytes read from an upstream stream.
 type countingReader struct {
 	r io.Reader
 	n *int64
@@ -878,7 +827,7 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// buildNotificationTool declares the MCP tool and its schema.
+// buildNotificationTool declares the send_notification tool.
 func buildNotificationTool() mcp.Tool {
 	return mcp.NewTool("send_notification",
 		mcp.WithDescription(
@@ -909,7 +858,7 @@ func buildNotificationTool() mcp.Tool {
 	)
 }
 
-// notificationHandler applies the arguments and publishes the notification.
+// notificationHandler handles send_notification calls.
 func notificationHandler(cfg config) server.ToolHandlerFunc {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args, err := parseArgs[notificationArgs](request)
@@ -918,10 +867,7 @@ func notificationHandler(cfg config) server.ToolHandlerFunc {
 			return nil, err
 		}
 
-		// Log the call with the token redacted by default: tokens must
-		// never reach the logs. Setting MCP_NTFY_UNSAFE_LOGS=1 at startup
-		// opts in to cleartext token logging, for debugging only. Client
-		// fields are logged with %q so they cannot forge log lines.
+		// Log with the token redacted; %q on client fields prevents log forging.
 		logged := args
 		if cfg.UnsafeLogs != "1" {
 			logged.Token = "[redacted]"
@@ -947,7 +893,7 @@ func notificationHandler(cfg config) server.ToolHandlerFunc {
 	}
 }
 
-// buildReadTool declares the read_notifications MCP tool and its schema.
+// buildReadTool declares the read_notifications tool.
 func buildReadTool() mcp.Tool {
 	return mcp.NewTool("read_notifications",
 		mcp.WithDescription(
@@ -974,7 +920,7 @@ func buildReadTool() mcp.Tool {
 	)
 }
 
-// readHandler applies the arguments and fetches the notifications.
+// readHandler handles read_notifications calls.
 func readHandler(cfg config) server.ToolHandlerFunc {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args, err := parseArgs[readArgs](request)
@@ -983,8 +929,7 @@ func readHandler(cfg config) server.ToolHandlerFunc {
 			return nil, err
 		}
 
-		// Same redaction policy as send_notification, and %q on client
-		// fields to prevent log forging.
+		// Same log redaction as send_notification.
 		logged := args
 		if cfg.UnsafeLogs != "1" {
 			logged.Token = "[redacted]"
@@ -1037,10 +982,7 @@ func main() {
 	srv.AddTool(buildReadTool(), readHandler(cfg))
 
 	if cfg.Transport == "stdio" {
-		// Stdio transport: newline-delimited JSON-RPC on stdin/stdout,
-		// the usual way MCP clients (Claude Desktop, etc.) spawn a local
-		// server. Logs stay on stderr so they never pollute the protocol
-		// channel on stdout.
+		// Stdio transport: JSON-RPC on stdin/stdout; logs stay on stderr.
 		log.Printf("server v.%s serving MCP over stdio", Version)
 		if err := server.ServeStdio(srv); err != nil {
 			log.Fatalf("fatal error: %v", err)
@@ -1050,10 +992,8 @@ func main() {
 
 	transport := server.NewStreamableHTTPServer(srv)
 
-	// Mount the MCP endpoint ourselves so the middlewares can wrap it:
-	// withRateLimit (per-IP request cap + body size cap) runs first,
-	// then withClientAuth (anti-spam, returns the handler unchanged when
-	// MCP_NTFY_CLIENT_TOKEN is not set).
+	// Wrap the MCP endpoint with the middlewares: rate limit first, then
+	// client auth (a no-op when MCP_NTFY_CLIENT_TOKEN is not set).
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", transport)
 
@@ -1061,8 +1001,7 @@ func main() {
 	httpSrv := &http.Server{
 		Addr:    addr,
 		Handler: withRateLimit(cfg.ClientLimiter, withClientAuth(cfg.ClientToken, cfg.AuthFailLimiter, mux)),
-		// Timeouts so slow or stalled clients cannot hold connections
-		// (and goroutines) forever.
+		// Timeouts so stalled clients cannot hold connections open.
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
