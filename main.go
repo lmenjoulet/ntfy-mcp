@@ -36,6 +36,11 @@
 //	                      within the window before HTTP 429 (default: 10)
 //	MCP_NTFY_MAX_CONCURRENT_UPSTREAM  Max concurrent upstream ntfy calls
 //	                      (default: 32)
+//	MCP_NTFY_TRUSTED_PROXIES  Comma-separated IPs/CIDRs of reverse proxies
+//	                      whose "X-Forwarded-For" header is trusted for the
+//	                      per-client rate limits (default: empty, only the
+//	                      direct peer IP is used). Set it only when a proxy
+//	                      you control appends the real client IP.
 //
 // An agent can override any of these variables in an MCP request.
 // Configure them according to your security model.
@@ -47,6 +52,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -57,6 +63,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
@@ -73,11 +80,14 @@ var Version = "dev"
 
 // Size and count limits.
 const (
-	maxMCPBodyBytes  = 1 << 20  // cap on an MCP request body
-	maxMessageBytes  = 4096     // ntfy limit for a notification body
-	maxFetchBytes    = 4 << 20  // cap on bytes read from an upstream stream
-	defaultReadLimit = 100      // read_notifications limit when omitted
-	maxReadLimit     = 1000     // hard cap on read_notifications limit
+	maxMCPBodyBytes  = 1 << 20 // cap on an MCP request body
+	maxMessageBytes  = 4096    // ntfy limit for a notification body
+	maxTitleBytes    = 512     // cap on the Title header sent upstream
+	maxTagsBytes     = 512     // cap on the Tags header sent upstream
+	maxFetchBytes    = 4 << 20 // cap on bytes read from an upstream stream
+	defaultReadLimit = 100     // read_notifications limit when omitted
+	maxReadLimit     = 1000    // hard cap on read_notifications limit
+	guardMaxEntries  = 10000   // cap on tracked targets / client IPs in the guards
 )
 
 // httpClient is shared by all requests so TCP connections are reused.
@@ -139,6 +149,11 @@ func isBlockedUpstreamIP(ip net.IP) bool {
 	if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
 		return true // CGNAT 100.64.0.0/10
 	}
+	// NAT64/464XLAT well-known prefix 64:ff9b::/96 can translate to
+	// internal IPv4 destinations on some networks.
+	if ip16 := ip.To16(); ip16 != nil && ip16[0] == 0x00 && ip16[1] == 0x64 && ip16[2] == 0xff && ip16[3] == 0x9b {
+		return true
+	}
 	return false
 }
 
@@ -158,25 +173,78 @@ type config struct {
 	MCPPort              int    // http transport only
 	ClientToken          string // Shared secret MCP clients must present; empty = no client auth
 	UnsafeLogs           string
-	AllowPrivateUpstream bool   // MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1: allow dialing private/loopback IPs upstream
+	AllowPrivateUpstream bool // MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1: allow dialing private/loopback IPs upstream
 	Guard                *upstreamGuard
-	ClientLimiter        *rateLimiter // per-IP rate limit on MCP requests; nil = disabled
-	AuthFailLimiter      *rateLimiter // per-IP throttle on failed client auth; nil = disabled
-	upstreamSem          chan struct{} // bounds concurrent upstream calls
+	ClientLimiter        *rateLimiter   // per-IP rate limit on MCP requests; nil = disabled
+	AuthFailLimiter      *rateLimiter   // per-IP throttle on failed client auth; nil = disabled
+	TrustedProxies       []netip.Prefix // reverse proxies whose X-Forwarded-For is trusted for the per-IP limits
+	upstreamSem          chan struct{}  // bounds concurrent upstream calls
+}
+
+// lruMap is a bounded map with O(1) amortized LRU eviction. Callers must
+// hold the owning mutex.
+type lruMap[V any] struct {
+	maxEntries int
+	items      map[string]*list.Element
+	lru        *list.List // front = most recently used; Value is *lruEntry[V]
+}
+
+type lruEntry[V any] struct {
+	key string
+	val V
+}
+
+func newLRUMap[V any](maxEntries int) *lruMap[V] {
+	return &lruMap[V]{
+		maxEntries: maxEntries,
+		items:      map[string]*list.Element{},
+		lru:        list.New(),
+	}
+}
+
+func (l *lruMap[V]) get(key string) (V, bool) {
+	if el, ok := l.items[key]; ok {
+		l.lru.MoveToFront(el)
+		return el.Value.(*lruEntry[V]).val, true
+	}
+	var zero V
+	return zero, false
+}
+
+func (l *lruMap[V]) set(key string, val V) {
+	if el, ok := l.items[key]; ok {
+		el.Value.(*lruEntry[V]).val = val
+		l.lru.MoveToFront(el)
+		return
+	}
+	l.items[key] = l.lru.PushFront(&lruEntry[V]{key: key, val: val})
+	if l.lru.Len() > l.maxEntries {
+		if back := l.lru.Back(); back != nil {
+			l.lru.Remove(back)
+			delete(l.items, back.Value.(*lruEntry[V]).key)
+		}
+	}
+}
+
+func (l *lruMap[V]) delete(key string) {
+	if el, ok := l.items[key]; ok {
+		l.lru.Remove(el)
+		delete(l.items, key)
+	}
 }
 
 // upstreamGuard temporarily blocks a target base URL that keeps getting
 // 401/403/429 upstream, so this server cannot be used to flood a
-// third-party ntfy. Keyed by base URL only: rotating tokens does not
-// evade a block.
+// third-party ntfy. Keyed by canonical base URL only: rotating tokens or
+// trivial URL variants (trailing slash, default port, host letter case)
+// do not evade a block.
 type upstreamGuard struct {
 	mu           sync.Mutex
 	maxFailures  int
 	window       time.Duration
 	blockFor     time.Duration
-	maxEntries   int                          // caps map size: targets are client-supplied
-	rejections   map[string][]time.Time // target -> recent rejection times
-	blockedUntil map[string]time.Time   // target -> end of the block
+	rejections   *lruMap[[]time.Time] // target -> recent rejection times
+	blockedUntil *lruMap[time.Time]   // target -> end of the block
 }
 
 func newUpstreamGuard(maxFailures, windowSec, blockSec int) *upstreamGuard {
@@ -187,31 +255,8 @@ func newUpstreamGuard(maxFailures, windowSec, blockSec int) *upstreamGuard {
 		maxFailures:  maxFailures,
 		window:       time.Duration(windowSec) * time.Second,
 		blockFor:     time.Duration(blockSec) * time.Second,
-		maxEntries:   10000,
-		rejections:   map[string][]time.Time{},
-		blockedUntil: map[string]time.Time{},
-	}
-}
-
-// evictIfNeeded drops the oldest entry once a map exceeds maxEntries.
-func (g *upstreamGuard) evictIfNeeded() {
-	if len(g.rejections) > g.maxEntries {
-		oldestKey, oldest := "", time.Time{}
-		for k, v := range g.rejections {
-			if oldestKey == "" || (len(v) > 0 && v[0].Before(oldest)) {
-				oldestKey, oldest = k, v[0]
-			}
-		}
-		delete(g.rejections, oldestKey)
-	}
-	if len(g.blockedUntil) > g.maxEntries {
-		oldestKey, oldest := "", time.Time{}
-		for k, until := range g.blockedUntil {
-			if oldestKey == "" || until.Before(oldest) {
-				oldestKey, oldest = k, until
-			}
-		}
-		delete(g.blockedUntil, oldestKey)
+		rejections:   newLRUMap[[]time.Time](guardMaxEntries),
+		blockedUntil: newLRUMap[time.Time](guardMaxEntries),
 	}
 }
 
@@ -219,14 +264,14 @@ func (g *upstreamGuard) evictIfNeeded() {
 func (g *upstreamGuard) allow(target string) time.Duration {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	until, blocked := g.blockedUntil[target]
+	until, blocked := g.blockedUntil.get(target)
 	if !blocked {
 		return 0
 	}
 	if remaining := time.Until(until); remaining > 0 {
 		return remaining
 	}
-	delete(g.blockedUntil, target)
+	g.blockedUntil.delete(target)
 	return 0
 }
 
@@ -240,20 +285,22 @@ func (g *upstreamGuard) noteRejection(target string, status int) {
 	defer g.mu.Unlock()
 	now := time.Now()
 	cutoff := now.Add(-g.window)
-	kept := g.rejections[target][:0]
-	for _, t := range g.rejections[target] {
+	times, _ := g.rejections.get(target)
+	kept := times[:0]
+	for _, t := range times {
 		if t.After(cutoff) {
 			kept = append(kept, t)
 		}
 	}
-	g.rejections[target] = append(kept, now)
-	if len(g.rejections[target]) >= g.maxFailures {
-		g.blockedUntil[target] = now.Add(g.blockFor)
-		delete(g.rejections, target)
+	kept = append(kept, now)
+	if len(kept) >= g.maxFailures {
+		g.blockedUntil.set(target, now.Add(g.blockFor))
+		g.rejections.delete(target)
 		log.Printf("upstream target %q BLOCKED for %s after %d rejections (HTTP %d) within %s",
 			target, g.blockFor, g.maxFailures, status, g.window)
+		return
 	}
-	g.evictIfNeeded()
+	g.rejections.set(target, kept)
 }
 
 // checkUpstreamAllowed refuses a blocked target before any upstream call.
@@ -261,11 +308,12 @@ func (c config) checkUpstreamAllowed(baseURL string) error {
 	if c.Guard == nil {
 		return nil
 	}
-	if remaining := c.Guard.allow(baseURL); remaining > 0 {
+	target := canonicalTarget(baseURL)
+	if remaining := c.Guard.allow(target); remaining > 0 {
 		log.Printf("BLOCKED request to %q: target temporarily blocked after repeated upstream rejections (retry in %s)",
-			baseURL, remaining.Round(time.Second))
+			target, remaining.Round(time.Second))
 		return &toolInputError{fmt.Sprintf("target %s is temporarily blocked after repeated rejected requests (upstream 401/403/429); retry in %s",
-			baseURL, remaining.Round(time.Second))}
+			target, remaining.Round(time.Second))}
 	}
 	return nil
 }
@@ -275,7 +323,7 @@ func (c config) noteUpstreamStatus(baseURL string, status int) {
 	if c.Guard == nil {
 		return
 	}
-	c.Guard.noteRejection(baseURL, status)
+	c.Guard.noteRejection(canonicalTarget(baseURL), status)
 }
 
 // loadConfig reads the environment and validates the result.
@@ -316,6 +364,11 @@ func loadConfig() (config, error) {
 	}
 	allowPrivate := isTruthy(getenv("MCP_NTFY_ALLOW_PRIVATE_UPSTREAM", "0"))
 
+	trustedProxies, err := parseTrustedProxies(getenv("MCP_NTFY_TRUSTED_PROXIES", ""))
+	if err != nil {
+		return cfg, fmt.Errorf("error getting MCP_NTFY_TRUSTED_PROXIES environment variable: %w", err)
+	}
+
 	transport := strings.ToLower(getenv("MCP_NTFY_TRANSPORT", "http"))
 	if transport != "http" && transport != "stdio" {
 		return cfg, fmt.Errorf("error getting MCP_NTFY_TRANSPORT environment variable: %q is not a valid transport (want \"http\" or \"stdio\")", transport)
@@ -332,8 +385,9 @@ func loadConfig() (config, error) {
 		UnsafeLogs:           getenv("MCP_NTFY_UNSAFE_LOGS", "0"),
 		AllowPrivateUpstream: allowPrivate,
 		Guard:                newUpstreamGuard(maxFail, windowSec, blockSec),
-		ClientLimiter:        newRateLimiter(clientRateLimit, windowSec, 10000),
-		AuthFailLimiter:      newRateLimiter(authFailLimit, windowSec, 10000),
+		ClientLimiter:        newRateLimiter(clientRateLimit, windowSec, guardMaxEntries),
+		AuthFailLimiter:      newRateLimiter(authFailLimit, windowSec, guardMaxEntries),
+		TrustedProxies:       trustedProxies,
 		upstreamSem:          make(chan struct{}, maxConcurrent),
 	}
 
@@ -359,6 +413,9 @@ func loadConfig() (config, error) {
 	}
 	log.Printf("client rate limit: %d MCP requests per %ds per client IP; %d failed authentications per %ds per IP before HTTP 429",
 		clientRateLimit, windowSec, authFailLimit, windowSec)
+	if len(trustedProxies) > 0 {
+		log.Printf("trusted proxies for X-Forwarded-For (per-client rate limits): %v", trustedProxies)
+	}
 
 	if cfg.Guard != nil {
 		log.Printf("upstream anti-DoS guard enabled: %d rejections (401/403/429) within %ds block a target for %ds",
@@ -386,6 +443,32 @@ func isTruthy(v string) bool {
 	return v == "1" || strings.EqualFold(v, "true")
 }
 
+// parseTrustedProxies parses a comma-separated list of proxy IPs or CIDRs
+// whose X-Forwarded-For header may be trusted for per-client rate limits.
+func parseTrustedProxies(s string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.Contains(part, "/") {
+			p, err := netip.ParsePrefix(part)
+			if err != nil {
+				return nil, fmt.Errorf("invalid CIDR %q: %w", part, err)
+			}
+			out = append(out, p)
+			continue
+		}
+		addr, err := netip.ParseAddr(part)
+		if err != nil {
+			return nil, fmt.Errorf("invalid IP %q: %w", part, err)
+		}
+		out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
+	}
+	return out, nil
+}
+
 // topicRe is the charset ntfy accepts; it also blocks path or query
 // injection into the upstream URL.
 var topicRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
@@ -400,6 +483,27 @@ func validateBaseURL(raw string) error {
 		return &toolInputError{"base_url must use the http or https scheme"}
 	}
 	return nil
+}
+
+// canonicalTarget normalizes a base URL into the key used by the upstream
+// guard, so variants denoting the same target (trailing slash, default
+// port, host letter case) share a single block.
+func canonicalTarget(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return raw
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if port == "" || (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		port = ""
+	}
+	authority := host
+	if port != "" {
+		authority = net.JoinHostPort(host, port)
+	}
+	return scheme + "://" + authority + strings.TrimRight(u.Path, "/")
 }
 
 // isLoopbackAddr reports whether the listen address is loopback.
@@ -429,11 +533,10 @@ func isLoopbackAddr(addr string) bool {
 
 // rateLimiter is a bounded per-key sliding-window counter.
 type rateLimiter struct {
-	mu         sync.Mutex
-	max        int
-	window     time.Duration
-	maxEntries int
-	hits       map[string][]time.Time
+	mu     sync.Mutex
+	max    int
+	window time.Duration
+	hits   *lruMap[[]time.Time]
 }
 
 func newRateLimiter(max, windowSec, maxEntries int) *rateLimiter {
@@ -441,10 +544,9 @@ func newRateLimiter(max, windowSec, maxEntries int) *rateLimiter {
 		return nil // disabled
 	}
 	return &rateLimiter{
-		max:        max,
-		window:     time.Duration(windowSec) * time.Second,
-		maxEntries: maxEntries,
-		hits:       map[string][]time.Time{},
+		max:    max,
+		window: time.Duration(windowSec) * time.Second,
+		hits:   newLRUMap[[]time.Time](maxEntries),
 	}
 }
 
@@ -457,38 +559,48 @@ func (l *rateLimiter) allow(key string) bool {
 	defer l.mu.Unlock()
 	now := time.Now()
 	cutoff := now.Add(-l.window)
-	kept := l.hits[key][:0]
-	for _, t := range l.hits[key] {
+	times, _ := l.hits.get(key)
+	kept := times[:0]
+	for _, t := range times {
 		if t.After(cutoff) {
 			kept = append(kept, t)
 		}
 	}
-	l.hits[key] = append(kept, now)
-	if len(l.hits) > l.maxEntries {
-		oldestKey, oldest := "", time.Time{}
-		for k, v := range l.hits {
-			if oldestKey == "" || (len(v) > 0 && v[0].Before(oldest)) {
-				oldestKey, oldest = k, v[0]
-			}
-		}
-		delete(l.hits, oldestKey)
-	}
-	return len(l.hits[key]) <= l.max
+	kept = append(kept, now)
+	l.hits.set(key, kept)
+	return len(kept) <= l.max
 }
 
-// clientIP returns the direct peer IP; X-Forwarded-For is not trusted (spoofable).
-func clientIP(r *http.Request) string {
+// clientIP returns the client IP used for rate limiting. X-Forwarded-For is
+// only honored when the direct peer is a trusted proxy (see
+// MCP_NTFY_TRUSTED_PROXIES); its last entry is used because it is the one
+// appended by the proxy closest to this server. Otherwise the direct peer
+// IP is used (a client-supplied X-Forwarded-For is spoofable).
+func clientIP(r *http.Request, trusted []netip.Prefix) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		for _, p := range trusted {
+			if p.Contains(addr) {
+				if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+					entries := strings.Split(xff, ",")
+					if last := strings.TrimSpace(entries[len(entries)-1]); last != "" {
+						return last
+					}
+				}
+				break
+			}
+		}
 	}
 	return host
 }
 
 // withRateLimit answers 429 past the per-IP limit and caps the request body.
-func withRateLimit(limiter *rateLimiter, next http.Handler) http.Handler {
+func withRateLimit(limiter *rateLimiter, trusted []netip.Prefix, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !limiter.allow(clientIP(r)) {
+		if !limiter.allow(clientIP(r, trusted)) {
 			log.Printf("RATE LIMITED request from %s to %s %s: too many requests", r.RemoteAddr, r.Method, r.URL.Path)
 			http.Error(w, "too many requests, retry later", http.StatusTooManyRequests)
 			return
@@ -518,7 +630,7 @@ func sameOrigin(rawA, rawB string) bool {
 // secret disables the check). Both sides are hashed and compared in
 // constant time; failures are throttled per IP and the presented token
 // is never logged.
-func withClientAuth(secret string, failLimiter *rateLimiter, next http.Handler) http.Handler {
+func withClientAuth(secret string, failLimiter *rateLimiter, trusted []netip.Prefix, next http.Handler) http.Handler {
 	if secret == "" {
 		return next
 	}
@@ -529,13 +641,13 @@ func withClientAuth(secret string, failLimiter *rateLimiter, next http.Handler) 
 		presentedHash := sha256.Sum256([]byte(presented))
 		if presented == r.Header.Get("Authorization") ||
 			subtle.ConstantTimeCompare(presentedHash[:], secretHash[:]) != 1 {
-			if !failLimiter.allow(clientIP(r)) {
+			if !failLimiter.allow(clientIP(r, trusted)) {
 				log.Printf("THROTTLED MCP request from %s to %s %s: too many failed authentication attempts", r.RemoteAddr, r.Method, r.URL.Path)
 				http.Error(w, "too many failed authentication attempts, retry later", http.StatusTooManyRequests)
 				return
 			}
 			log.Printf("REJECTED MCP request from %s to %s %s: missing or invalid client token", r.RemoteAddr, r.Method, r.URL.Path)
-			w.Header().Set("WWW-Authenticate", `Bearer realm=\"ntfy-mcp\"`)
+			w.Header().Set("WWW-Authenticate", `Bearer realm="ntfy-mcp"`)
 			http.Error(w, "unauthorized: a valid Bearer token is required", http.StatusUnauthorized)
 			return
 		}
@@ -579,6 +691,12 @@ func (c config) publish(ctx context.Context, args notificationArgs) error {
 	}
 	if len(args.Message) > maxMessageBytes {
 		return &toolInputError{fmt.Sprintf("message exceeds the %d-byte limit of the ntfy server", maxMessageBytes)}
+	}
+	if len(args.Title) > maxTitleBytes {
+		return &toolInputError{fmt.Sprintf("title exceeds the %d-byte limit", maxTitleBytes)}
+	}
+	if len(args.Tags) > maxTagsBytes {
+		return &toolInputError{fmt.Sprintf("tags exceed the %d-byte limit", maxTagsBytes)}
 	}
 	if err := c.acquireUpstreamSlot(ctx); err != nil {
 		return err
@@ -999,8 +1117,9 @@ func main() {
 
 	addr := fmt.Sprintf("%s:%d", cfg.MCPAddr, cfg.MCPPort)
 	httpSrv := &http.Server{
-		Addr:    addr,
-		Handler: withRateLimit(cfg.ClientLimiter, withClientAuth(cfg.ClientToken, cfg.AuthFailLimiter, mux)),
+		Addr: addr,
+		Handler: withRateLimit(cfg.ClientLimiter, cfg.TrustedProxies,
+			withClientAuth(cfg.ClientToken, cfg.AuthFailLimiter, cfg.TrustedProxies, mux)),
 		// Timeouts so stalled clients cannot hold connections open.
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
