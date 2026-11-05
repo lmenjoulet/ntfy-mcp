@@ -70,8 +70,8 @@ Configure the server using environment variables:
 | `MCP_NTFY_CLIENT_RATE_LIMIT` | `120`    | Max MCP requests per client IP within the window; over the limit → `429`; `0` disables |
 | `MCP_NTFY_AUTH_FAILURE_LIMIT` | `10`     | Max failed client authentications per IP within the window before `429` (anti brute force) |
 | `MCP_NTFY_MAX_CONCURRENT_UPSTREAM` | `32` | Max concurrent calls to upstream ntfy servers |
-| `MCP_NTFY_ALLOW_PRIVATE_UPSTREAM` | `0`   | `1` allows upstream connections to private/loopback/link-local IPs (self-hosted ntfy on the LAN only); by default such IPs are refused at dial time (anti-SSRF) |
-| `MCP_NTFY_UNSAFE_LOGS` | `0`               | Log level for unsafe logging; `1` logs tokens in cleartext (a startup warning is emitted if combined with a non-loopback `MCP_NTFY_ADDR`) |
+| `MCP_NTFY_ALLOW_PRIVATE_UPSTREAM` | `0`   | `1` allows upstream connections to private/loopback/link-local IPs (self-hosted ntfy on the LAN only); refused by default (anti-SSRF) |
+| `MCP_NTFY_UNSAFE_LOGS` | `0`               | `1` logs tokens in cleartext for debugging; startup warning if combined with a non-loopback `MCP_NTFY_ADDR` |
 
 
 ### Running as a NixOS service
@@ -130,67 +130,28 @@ A NixOS evaluation warning is emitted when `address` is not loopback and `client
 
 ## Security considerations
 
-### Setting variables
+### Deployment regimes
 
-The server supports two deployment regimes, depending on whether the `NTFY_TOKEN` environment variable is set:
+The server supports two regimes, depending on whether `NTFY_TOKEN` is set:
 
-- **Private server**: the token stays server-side (`NTFY_TOKEN`) and agents only provide `message`, `title`, `priority` and `tags`. The agent never sees any credential and cannot choose the ntfy server URL (to prevent token exfiltration).
-- **Public server**: agents provide `base_url` and `token` themselves — clients authenticate against the *target* ntfy server with their own token, so `MCP_NTFY_CLIENT_TOKEN` is not needed there (it stays optional, and only restricts who may use the MCP proxy at all). This allows multiplexing several ntfy backends through one MCP server.
+- **Private server** (default): the token stays server-side and agents only provide `message`, `title`, `priority` and `tags` — they never see a credential and cannot choose the upstream ntfy URL.
+- **Public server**: agents provide `base_url` and `token` themselves and authenticate against the target ntfy server with their own token, so one MCP server can multiplex several ntfy backends.
 
-### MCP client authentication (anti-spam)
+### Exposing the server
 
-By default the server only listens on loopback. If you expose it more widely (`MCP_NTFY_ADDR=0.0.0.0`, or through a reverse proxy that does not authenticate clients), set `MCP_NTFY_CLIENT_TOKEN` to a shared secret: every MCP request must then carry it in an `Authorization: Bearer <token>` header, and any request without a valid token is rejected with `401 Unauthorized` before reaching the tools. This prevents unauthenticated users from spamming notifications through your ntfy topic. The comparison is constant-time and the presented token is never logged.
+The server listens on loopback by default and speaks plain HTTP. Expose it beyond loopback only behind a **TLS-terminating reverse proxy** (nginx, Caddy, Traefik, …) and set `MCP_NTFY_CLIENT_TOKEN`: every MCP request must then carry it as `Authorization: Bearer <token>` and is rejected with `401` otherwise, so unauthenticated users cannot spam notifications through your topic.
 
-```bash
-export MCP_NTFY_CLIENT_TOKEN=another_long_random_secret
-./ntfy-mcp
-# clients then call the endpoint with:
-#   Authorization: Bearer another_long_random_secret
-```
+### Built-in protections
 
-When `MCP_NTFY_CLIENT_TOKEN` is empty (the default), no client authentication is performed — keep the server on loopback or behind an authenticated reverse proxy in that case.
+In the public-server regime the server refuses to act as an open proxy to the internal network: upstream targets on private/loopback/link-local IPs (including cloud metadata endpoints) are rejected by default (anti-SSRF — set `MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1` only for a self-hosted ntfy on the LAN, never on an Internet-exposed endpoint), and a target that repeatedly answers `401`/`403`/`429` is temporarily blocked without any upstream call (anti proxy-DoS).
 
-The server itself speaks plain HTTP. When exposing it beyond loopback, always put it behind a **TLS-terminating reverse proxy** (nginx, Caddy, Traefik, …) so the `MCP_NTFY_CLIENT_TOKEN` Bearer header and the notification content are never sent in cleartext on the network.
+Per-IP rate limits, request/body size caps, message size limits and upstream concurrency caps are also enforced by default; all tunables are in the environment table above. Implementation details live in `main.go` — reading the source is the reference.
 
-### Upstream rate limiting (anti proxy-DoS)
+### Errors and logging
 
-In the public-server regime, a client could otherwise use this MCP server as a proxy to flood a third-party ntfy server (e.g. by sending many requests that the target rejects with `401`). To prevent that, the server keeps an **upstream guard**: when a target base URL accumulates `MCP_NTFY_RATE_LIMIT_FAILURES` rejection responses (`401`/`403`/`429`) within `MCP_NTFY_RATE_LIMIT_WINDOW` seconds, that target is blocked for `MCP_NTFY_RATE_LIMIT_BLOCK` seconds and requests to it are refused locally, **without any upstream call**.
+Only errors caused by the client's own input are returned to the MCP client; internal errors and upstream response bodies are logged server-side and never leak to clients.
 
-The guard is keyed by target base URL only, not by request token, so rotating tokens cannot evade the block. Set `MCP_NTFY_RATE_LIMIT_FAILURES=0` to disable it.
-
-### Upstream SSRF protection
-
-In the public-server regime (client-provided `base_url` + `token`), the server must never become an open proxy to the internal network. Two layers apply to every upstream connection:
-
-- **Scheme and shape**: `base_url` must be an absolute `http`/`https` URL without embedded credentials; anything else is rejected. The `topic` argument is restricted to the ntfy charset (`[A-Za-z0-9_-]{1,64}`), so it cannot inject path segments (`../`), query (`?`) or fragment (`#`) into the upstream URL.
-- **Dial-time IP check**: loopback, private (RFC 1918 + ULA), link-local (including the cloud metadata endpoint `169.254.169.254`), CGNAT, multicast and unspecified addresses are refused when the connection is established, on the *resolved* addresses, and the connection is pinned to a validated IP — so DNS rebinding cannot bypass it. TLS certificate verification is unaffected (ServerName still comes from the URL).
-
-Set `MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1` only if your ntfy server is self-hosted on a private/loopback address; this weakens the protection and should never be combined with an Internet-exposed MCP endpoint.
-
-### Rate limiting and resource caps (anti-DoS)
-
-- Per client IP (direct peer; `X-Forwarded-For` is deliberately not trusted): max `MCP_NTFY_CLIENT_RATE_LIMIT` MCP requests per `MCP_NTFY_RATE_LIMIT_WINDOW` seconds (`429` when exceeded), and max `MCP_NTFY_AUTH_FAILURE_LIMIT` failed authentications per window before `429` (anti brute force on `MCP_NTFY_CLIENT_TOKEN`).
-- MCP request bodies are capped at 1 MiB; the HTTP server sets read/write/idle timeouts so stalled clients cannot hold connections forever.
-- `message` is capped at 4096 bytes (the ntfy server limit).
-- `read_notifications` reads at most `limit` messages (default 100, hard cap 1000) and at most 4 MiB of stream.
-- At most `MCP_NTFY_MAX_CONCURRENT_UPSTREAM` upstream calls run concurrently.
-- The upstream guard's internal maps are size-capped, so spraying unique `base_url` values cannot exhaust memory.
-
-### Error handling and logging hygiene
-
-Errors caused by the client's own input (invalid `base_url`/`topic`, oversized `message`, temporarily blocked target) are returned explicitly to the MCP client. All other errors (network failures, upstream status/body, internal details) are logged server-side only and replaced by a generic message, so internal details and upstream response bodies never leak to MCP clients. Client-controlled fields are logged with `%q` to prevent log forging.
-
-### Logging
-
-The server logs to stderr with the `[ntfy-mcp]` prefix. By default, tokens are replaced with `[redacted]` in log lines, which can be an annoyance when troubleshooting connection issues.
-
-For debugging, set `MCP_NTFY_UNSAFE_LOGS=1` to log authentication tokens in cleartext.
-
-```bash
-MCP_NTFY_UNSAFE_LOGS=1 ./ntfy-mcp
-```
-
-Logs are not a secret-safe place: never enable this on a production or multi-user system, and only temporarily while diagnosing authentication failures.
+Logs go to stderr with the `[ntfy-mcp]` prefix, with tokens redacted as `[redacted]` by default. `MCP_NTFY_UNSAFE_LOGS=1` logs tokens in cleartext for debugging — use it only temporarily, never in production (a startup warning is emitted if combined with a non-loopback `MCP_NTFY_ADDR`).
 
 ## Building
 
