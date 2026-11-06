@@ -58,6 +58,7 @@ Set `MCP_NTFY_TRANSPORT=stdio` to serve MCP over stdin/stdout instead of HTTP â€
 | `MCP_NTFY_AUTH_FAILURE_LIMIT` | `10` | Max failed authentications per IP per window (`429` over) |
 | `MCP_NTFY_MAX_CONCURRENT_UPSTREAM` | `32` | Max concurrent upstream calls |
 | `MCP_NTFY_TRUSTED_PROXIES` | *empty* | Comma-separated proxy IPs/CIDRs whose `X-Forwarded-For` is trusted for the per-client rate limits (set it when the server sits behind a reverse proxy you control) |
+| `MCP_NTFY_ALLOWED_HOSTS` | *empty* | Comma-separated public Host values accepted on `/mcp` when listening on loopback â€” the MCP transport rejects non-loopback `Host` headers on loopback connections (DNS-rebinding guard), so a proxy that preserves the public `Host` gets `403`; this setting rewrites a matching `Host` to the loopback address. Prefer `proxy_set_header Host 127.0.0.1;` in the proxy when you control it |
 | `MCP_NTFY_ALLOW_PRIVATE_UPSTREAM` | `0` | `1` allows private/loopback upstream IPs (LAN-hosted ntfy only) |
 | `MCP_NTFY_UNSAFE_LOGS` | `0` | `1` logs tokens in cleartext (debug only) |
 
@@ -90,6 +91,7 @@ Example configuration with an nginx reverse proxy.
     tokenFile = "/run/secrets/ntfy-mcp-token";               # one NTFY_TOKEN=... line
     clientTokenFile = "/run/secrets/ntfy-mcp-client-token";  # one MCP_NTFY_CLIENT_TOKEN=... line
     trustedProxies = [ "127.0.0.1/32" ]; # trust nginx's X-Forwarded-For for per-client rate limits
+    # allowedHosts = [ "ntfy-mcp.example.com" ]; # accept this public Host on /mcp (alternative to "proxy_set_header Host 127.0.0.1;" in nginx)
     # allowPrivateUpstream = true;      # self-hosted ntfy on the LAN only
   };
 
@@ -101,6 +103,9 @@ Example configuration with an nginx reverse proxy.
         proxyPass = "http://127.0.0.1:12120";
         extraConfig = ''
           proxy_http_version 1.1;
+          # mcp-go rejects requests whose Host header is not loopback when the
+          # server listens on 127.0.0.1 (DNS-rebinding protection): rewrite it.
+          proxy_set_header Host 127.0.0.1;
           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
           proxy_buffering off;
           proxy_read_timeout 300s;

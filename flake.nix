@@ -137,6 +137,21 @@
           [ "127.0.0.1/32" ] avec un nginx local.
         '';
       };
+
+      allowedHosts = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = ''
+          Valeurs publiques de l'en-tête Host acceptées sur /mcp quand le
+          serveur écoute sur localhost (MCP_NTFY_ALLOWED_HOSTS), ex.
+          [ "ntfy-mcp.example.com" ]. Le transport MCP refuse les en-têtes
+          Host non-localhost sur une connexion loopback (protection
+          anti-DNS-rebinding) : cette option réécrit l'en-tête Host
+          correspondant en adresse loopback. Alternative à
+          "proxy_set_header Host 127.0.0.1;" dans le proxy inverse,
+          à utiliser quand on ne contrôle pas le proxy.
+        '';
+      };
     };
 
     config = lib.mkIf cfg.enable {
@@ -160,7 +175,8 @@
       "NTFY_TOPIC=${cfg.ntfyTopic}"
     ]
     ++ lib.optional cfg.allowPrivateUpstream "MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1"
-    ++ lib.optional (cfg.trustedProxies != [ ]) "MCP_NTFY_TRUSTED_PROXIES=${lib.concatStringsSep "," cfg.trustedProxies}";
+    ++ lib.optional (cfg.trustedProxies != [ ]) "MCP_NTFY_TRUSTED_PROXIES=${lib.concatStringsSep "," cfg.trustedProxies}"
+    ++ lib.optional (cfg.allowedHosts != [ ]) "MCP_NTFY_ALLOWED_HOSTS=${lib.concatStringsSep "," cfg.allowedHosts}";
     EnvironmentFile =
       (lib.optional (cfg.tokenFile != null) cfg.tokenFile)
       ++ (lib.optional (cfg.clientTokenFile != null) cfg.clientTokenFile);

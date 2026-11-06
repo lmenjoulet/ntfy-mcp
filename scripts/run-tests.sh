@@ -26,6 +26,7 @@ MCP_AUTH_PORT="${MCP_AUTH_TEST_PORT:-12322}"
 MCP_GUARD_PORT="${MCP_GUARD_TEST_PORT:-12323}"
 MCP_PROXY_PORT="${MCP_PROXY_TEST_PORT:-12324}"
 MCP_SHUTDOWN_PORT="${MCP_SHUTDOWN_TEST_PORT:-12325}"
+MCP_HOSTS_PORT="${MCP_HOSTS_TEST_PORT:-12326}"
 FAKE_NTFY_URL="http://127.0.0.1:$FAKE_NTFY_PORT"
 export MCP_BASE_URL="http://127.0.0.1:$MCP_TEST_PORT/mcp"
 TEST_TOKEN="test-secret-token"
@@ -38,6 +39,7 @@ MCP_AUTH_PID=""
 MCP_GUARD_PID=""
 MCP_PROXY_PID=""
 MCP_SHUTDOWN_PID=""
+MCP_HOSTS_PID=""
 # Servers are started with setsid so cleanup can kill the whole process
 # group (e.g. "go run" and the compiled fake-ntfy it spawns).
 cleanup() {
@@ -46,6 +48,7 @@ cleanup() {
     [ -n "$MCP_GUARD_PID" ] && kill -- -"$MCP_GUARD_PID" 2>/dev/null || true
     [ -n "$MCP_PROXY_PID" ] && kill -- -"$MCP_PROXY_PID" 2>/dev/null || true
     [ -n "$MCP_SHUTDOWN_PID" ] && kill -- -"$MCP_SHUTDOWN_PID" 2>/dev/null || true
+    [ -n "$MCP_HOSTS_PID" ] && kill -- -"$MCP_HOSTS_PID" 2>/dev/null || true
     [ -n "$FAKE_PID" ] && kill -- -"$FAKE_PID" 2>/dev/null || true
     rm -rf "$TMP"
 }
@@ -58,9 +61,9 @@ port_in_use() {
     fi
     return 1
 }
-if port_in_use "$FAKE_NTFY_PORT" || port_in_use "$MCP_TEST_PORT" || port_in_use "$MCP_AUTH_PORT" || port_in_use "$MCP_GUARD_PORT" || port_in_use "$MCP_PROXY_PORT" || port_in_use "$MCP_SHUTDOWN_PORT"; then
-    echo "ERROR: port $FAKE_NTFY_PORT, $MCP_TEST_PORT, $MCP_AUTH_PORT, $MCP_GUARD_PORT, $MCP_PROXY_PORT or $MCP_SHUTDOWN_PORT is already in use;" >&2
-    echo "set FAKE_NTFY_PORT / MCP_TEST_PORT / MCP_AUTH_TEST_PORT / MCP_GUARD_TEST_PORT / MCP_PROXY_TEST_PORT / MCP_SHUTDOWN_TEST_PORT to free ports" >&2
+if port_in_use "$FAKE_NTFY_PORT" || port_in_use "$MCP_TEST_PORT" || port_in_use "$MCP_AUTH_PORT" || port_in_use "$MCP_GUARD_PORT" || port_in_use "$MCP_PROXY_PORT" || port_in_use "$MCP_SHUTDOWN_PORT" || port_in_use "$MCP_HOSTS_PORT"; then
+    echo "ERROR: port $FAKE_NTFY_PORT, $MCP_TEST_PORT, $MCP_AUTH_PORT, $MCP_GUARD_PORT, $MCP_PROXY_PORT, $MCP_SHUTDOWN_PORT or $MCP_HOSTS_PORT is already in use;" >&2
+    echo "set FAKE_NTFY_PORT / MCP_TEST_PORT / MCP_AUTH_TEST_PORT / MCP_GUARD_TEST_PORT / MCP_PROXY_TEST_PORT / MCP_SHUTDOWN_TEST_PORT / MCP_HOSTS_TEST_PORT to free ports" >&2
     exit 1
 fi
 
@@ -507,6 +510,43 @@ if [ "$code" = "200" ]; then
 else
     ko "/healthz stays 200 while the client IP is rate-limited (got $code)"
 fi
+
+echo "== phase 6b: MCP_NTFY_ALLOWED_HOSTS (public Host forwarded by a proxy) =="
+
+# Dedicated instance with an allowlisted public Host and a client token.
+setsid env NTFY_URL="$FAKE_NTFY_URL" NTFY_TOPIC="$TEST_TOPIC" NTFY_TOKEN="$TEST_TOKEN" \
+    MCP_NTFY_PORT="$MCP_HOSTS_PORT" MCP_NTFY_CLIENT_TOKEN="$CLIENT_TOKEN" \
+    MCP_NTFY_ALLOWED_HOSTS="ntfy.example.com" MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1 \
+    "$TMP/ntfy-mcp" >"$TMP/mcp-hosts.log" 2>&1 &
+MCP_HOSTS_PID=$!
+wait_for_port 127.0.0.1 "$MCP_HOSTS_PORT"
+
+HOSTS_URL="http://127.0.0.1:$MCP_HOSTS_PORT/mcp"
+hosts_post() { # $1 = Host header value -> http status code
+    curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST "$HOSTS_URL" \
+        -H "Host: $1" -H "Authorization: Bearer $CLIENT_TOKEN" \
+        -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+        -d "$INIT_BODY"
+}
+
+# The allowlisted public Host is rewritten to the loopback listen address and
+# accepted by the transport's DNS-rebinding guard.
+code="$(hosts_post ntfy.example.com)"
+if [ "$code" = "200" ]; then ok "allowlisted public Host -> HTTP 200"; else ko "allowlisted public Host -> HTTP 200 (got $code)"; fi
+
+# Any other public Host is still rejected by the guard.
+code="$(hosts_post evil.example.com)"
+if [ "$code" = "403" ]; then ok "non-allowlisted public Host -> HTTP 403"; else ko "non-allowlisted public Host -> HTTP 403 (got $code)"; fi
+
+# A loopback Host keeps working as before.
+code="$(hosts_post 127.0.0.1)"
+if [ "$code" = "200" ]; then ok "loopback Host -> HTTP 200"; else ko "loopback Host -> HTTP 200 (got $code)"; fi
+
+# The allowlist does not bypass client authentication.
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST "$HOSTS_URL" \
+    -H 'Host: ntfy.example.com' -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' -d "$INIT_BODY")"
+if [ "$code" = "401" ]; then ok "allowlisted Host without token -> HTTP 401"; else ko "allowlisted Host without token -> HTTP 401 (got $code)"; fi
 
 echo "== phase 7: /healthz and graceful shutdown (SIGTERM/SIGINT) =="
 

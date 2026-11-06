@@ -41,6 +41,15 @@
 //	                      per-client rate limits (default: empty, only the
 //	                      direct peer IP is used). Set it only when a proxy
 //	                      you control appends the real client IP.
+//	MCP_NTFY_ALLOWED_HOSTS  Comma-separated public Host values (e.g. the
+//	                      domain name the reverse proxy serves) accepted on
+//	                      the MCP endpoint when listening on loopback: matching
+//	                      requests get their Host header rewritten to the
+//	                      loopback listen address so the transport's
+//	                      DNS-rebinding guard accepts them (default: empty).
+//	                      Prefer rewriting Host in the proxy itself
+//	                      ("proxy_set_header Host 127.0.0.1;") when you
+//	                      control it.
 //
 // In an MCP request, base_url, token and topic fall back to the configured
 // values above.
@@ -181,7 +190,8 @@ type config struct {
 	ClientLimiter        *rateLimiter   // per-IP rate limit on MCP requests; nil = disabled
 	AuthFailLimiter      *rateLimiter   // per-IP throttle on failed client auth; nil = disabled
 	TrustedProxies       []netip.Prefix // reverse proxies whose X-Forwarded-For is trusted for the per-IP limits
-	upstreamSem          chan struct{}  // bounds concurrent upstream calls
+	AllowedHosts         map[string]bool // MCP_NTFY_ALLOWED_HOSTS: public Host values accepted on /mcp (rewritten to the loopback listen address)
+	upstreamSem          chan struct{}   // bounds concurrent upstream calls
 }
 
 // lruMap is a bounded map with O(1) amortized LRU eviction. Callers must
@@ -368,6 +378,7 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return cfg, fmt.Errorf("error getting MCP_NTFY_TRUSTED_PROXIES environment variable: %w", err)
 	}
+	allowedHosts := parseAllowedHosts(getenv("MCP_NTFY_ALLOWED_HOSTS", ""))
 
 	transport := strings.ToLower(getenv("MCP_NTFY_TRANSPORT", "http"))
 	if transport != "http" && transport != "stdio" {
@@ -388,6 +399,7 @@ func loadConfig() (config, error) {
 		ClientLimiter:        newRateLimiter(clientRateLimit, windowSec, guardMaxEntries),
 		AuthFailLimiter:      newRateLimiter(authFailLimit, windowSec, guardMaxEntries),
 		TrustedProxies:       trustedProxies,
+		AllowedHosts:         allowedHosts,
 		upstreamSem:          make(chan struct{}, maxConcurrent),
 	}
 
@@ -415,6 +427,13 @@ func loadConfig() (config, error) {
 		clientRateLimit, windowSec, authFailLimit, windowSec)
 	if len(trustedProxies) > 0 {
 		log.Printf("trusted proxies for X-Forwarded-For (per-client rate limits): %v", trustedProxies)
+	}
+	if len(allowedHosts) > 0 {
+		hosts := make([]string, 0, len(allowedHosts))
+		for h := range allowedHosts {
+			hosts = append(hosts, h)
+		}
+		log.Printf("MCP_NTFY_ALLOWED_HOSTS: these public Host headers are accepted on /mcp (rewritten to the loopback listen address): %q", hosts)
 	}
 
 	if cfg.Guard != nil {
@@ -467,6 +486,27 @@ func parseTrustedProxies(s string) ([]netip.Prefix, error) {
 		out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
 	}
 	return out, nil
+}
+
+// parseAllowedHosts parses a comma-separated list of Host values (with or
+// without port) into a set of lowercase hostnames. Empty input returns nil.
+func parseAllowedHosts(s string) map[string]bool {
+	var out map[string]bool
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if host, _, err := net.SplitHostPort(part); err == nil {
+			part = host
+		}
+		part = strings.ToLower(strings.Trim(part, "[]"))
+		if out == nil {
+			out = map[string]bool{}
+		}
+		out[part] = true
+	}
+	return out
 }
 
 // topicRe is the charset ntfy accepts for a topic.
@@ -665,6 +705,31 @@ func withClientAuth(secret string, failLimiter *rateLimiter, trusted []netip.Pre
 			log.Printf("REJECTED MCP request from %s to %s %q: missing or invalid client token", r.RemoteAddr, r.Method, r.URL.Path)
 			w.Header().Set("WWW-Authenticate", `Bearer realm="ntfy-mcp"`)
 			http.Error(w, "unauthorized: a valid Bearer token is required", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withAllowedHosts rewrites the Host header of requests whose Host matches
+// the configured allowlist to the loopback listen address. The MCP transport
+// rejects non-loopback Host headers on loopback connections (DNS-rebinding
+// guard), which breaks reverse proxies that preserve the public Host; this
+// lets exactly the configured public names through, any other Host still
+// hits the guard.
+func withAllowedHosts(allowed map[string]bool, loopbackHost string, next http.Handler) http.Handler {
+	if len(allowed) == 0 {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(r.Host); err == nil {
+			host = h
+		}
+		if allowed[strings.ToLower(strings.Trim(host, "[]"))] {
+			r2 := r.Clone(r.Context())
+			r2.Host = loopbackHost
+			next.ServeHTTP(w, r2)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -1205,8 +1270,14 @@ func main() {
 	// /mcp is rate-limited per client IP and its body capped; /healthz is
 	// not rate-limited. Both endpoints require the Bearer token when
 	// MCP_NTFY_CLIENT_TOKEN is set.
+	loopbackHost := cfg.MCPAddr
+	if host, _, err := net.SplitHostPort(cfg.MCPAddr); err == nil {
+		loopbackHost = host
+	}
+	loopbackHost = strings.Trim(loopbackHost, "[]")
+
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", withRateLimit(cfg.ClientLimiter, cfg.TrustedProxies, transport))
+	mux.Handle("/mcp", withAllowedHosts(cfg.AllowedHosts, loopbackHost, withRateLimit(cfg.ClientLimiter, cfg.TrustedProxies, transport)))
 	mux.HandleFunc("/healthz", healthzHandler)
 
 	addr := fmt.Sprintf("%s:%d", cfg.MCPAddr, cfg.MCPPort)
