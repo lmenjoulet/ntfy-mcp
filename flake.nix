@@ -16,7 +16,7 @@
       packages = forEachSystem ({ pkgs }: {
   ntfy-mcp = pkgs.buildGoModule rec {
     pname = "ntfy-mcp";
-    version = "0.5.0";
+    version = "1.0.0";
     src = self;
     ldflags = [
       "-X main.Version=${version}"
@@ -24,7 +24,7 @@
       "-w"
     ];
     env.CGO_ENABLED = "0";
-    vendorHash = "sha256-MUVW6/ZiQ5h8AUVbu/yzVhUEGvA5NoxdAYH50skkak4=";
+    vendorHash = "sha256-xfaB0gV5j1bPu1du6fzKq5IIiubWqaYez9n1UMcStHw=";
     meta = with pkgs.lib; {
       description = "Serveur MCP d'envoi de notifications ntfy";
       license = licenses.gpl3;
