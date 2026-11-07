@@ -19,3 +19,5 @@
 | `MCP_NTFY_ALLOWED_HOSTS` | *empty* | Comma-separated public Host values accepted on `/mcp` when listening on loopback; use when a reverse proxy keeps the public Host. Prefer `proxy_set_header Host 127.0.0.1;` when you control the proxy |
 | `MCP_NTFY_ALLOW_PRIVATE_UPSTREAM` | `0` | `1` allows private/loopback upstream IPs (LAN-hosted ntfy only, never on an Internet-exposed endpoint) |
 | `MCP_NTFY_UNSAFE_LOGS` | `0` | `1` logs tokens in cleartext (debug only, never in production) |
+
+Invalid values (port outside 1-65535, negative limits, malformed `NTFY_TOPIC`, `MCP_NTFY_ADDR` or `MCP_NTFY_ALLOWED_HOSTS` entry) are rejected at startup with an error naming the variable. A `NTFY_URL` that is or resolves to a private/loopback address is also rejected at startup unless `MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1`.

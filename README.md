@@ -44,6 +44,8 @@ Set `MCP_NTFY_TRANSPORT=stdio` to serve MCP over stdin/stdout instead of HTTP â€
 
 See [docs/environment-variables.md](docs/environment-variables.md).
 
+<!-- TODO: add a doc listing all services.ntfy-mcp options (e.g. docs/nixos-options.md) -->
+
 ### Running as a NixOS service
 
 The flake exposes a NixOS module:

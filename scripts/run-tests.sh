@@ -383,8 +383,10 @@ assert_contains "invalid transport error is explicit" "$(cat "$TMP/mcp-bogus.log
 echo "== phase 5: input validation and SSRF guard (no MCP_NTFY_ALLOW_PRIVATE_UPSTREAM) =="
 # This instance runs with the secure defaults: private/loopback upstream
 # IPs are refused at dial time, base_url must be http(s), topic must
-# match the ntfy charset, message size is capped.
-setsid env NTFY_URL="$FAKE_NTFY_URL" NTFY_TOPIC="$TEST_TOPIC" NTFY_TOKEN="$TEST_TOKEN" \
+# match the ntfy charset, message size is capped. Its default NTFY_URL is
+# TEST-NET-1 (192.0.2.1, unroutable): public enough to pass the startup
+# check, unreachable so no test can leak to a real server.
+setsid env NTFY_URL="http://192.0.2.1:$FAKE_NTFY_PORT" NTFY_TOPIC="$TEST_TOPIC" NTFY_TOKEN="$TEST_TOKEN" \
     MCP_NTFY_PORT="$MCP_GUARD_PORT" \
     "$TMP/ntfy-mcp" >"$TMP/mcp-guard.log" 2>&1 &
 MCP_GUARD_PID=$!
@@ -596,6 +598,32 @@ if port_in_use "$MCP_SHUTDOWN_PORT"; then ko "listener closed after SIGTERM"; el
 start_shutdown_instance ""
 stop_with_signal INT
 if [ "$RC" = "0" ]; then ok "SIGINT -> graceful exit code 0"; else ko "SIGINT -> graceful exit code 0 (got $RC)"; fi
+
+echo "== phase 8: invalid configuration is rejected at startup =="
+
+# expect_startup_error NAME WANTED_FRAGMENT [VAR=VALUE ...]
+# The server must exit non-zero at once and name the offending variable.
+expect_startup_error() {
+    local name="$1" want="$2"; shift 2
+    local out rc
+    out="$(timeout 5 env "$@" "$TMP/ntfy-mcp" 2>&1)" && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && printf '%s' "$out" | grep -qF -- "$want"; then
+        ok "$name"
+    else
+        ko "$name (rc=$rc, output: $out)"
+    fi
+}
+
+expect_startup_error "MCP_NTFY_PORT out of range" "invalid MCP_NTFY_PORT" MCP_NTFY_PORT=99999
+expect_startup_error "MCP_NTFY_PORT not a number" "invalid MCP_NTFY_PORT" MCP_NTFY_PORT=abc
+expect_startup_error "MCP_NTFY_RATE_LIMIT_WINDOW=0 rejected" "invalid MCP_NTFY_RATE_LIMIT_WINDOW" MCP_NTFY_RATE_LIMIT_WINDOW=0
+expect_startup_error "negative MCP_NTFY_RATE_LIMIT_FAILURES rejected" "invalid MCP_NTFY_RATE_LIMIT_FAILURES" MCP_NTFY_RATE_LIMIT_FAILURES=-1
+expect_startup_error "MCP_NTFY_MAX_CONCURRENT_UPSTREAM=0 rejected" "invalid MCP_NTFY_MAX_CONCURRENT_UPSTREAM" MCP_NTFY_MAX_CONCURRENT_UPSTREAM=0
+expect_startup_error "invalid NTFY_TOPIC rejected" "invalid NTFY_TOPIC" NTFY_TOPIC="bad topic!"
+expect_startup_error "invalid MCP_NTFY_ADDR rejected" "invalid MCP_NTFY_ADDR" MCP_NTFY_ADDR="not an addr!"
+expect_startup_error "invalid MCP_NTFY_ALLOWED_HOSTS entry rejected" "MCP_NTFY_ALLOWED_HOSTS" MCP_NTFY_ALLOWED_HOSTS="bad host!"
+expect_startup_error "NTFY_URL private IP rejected without ALLOW_PRIVATE_UPSTREAM" "MCP_NTFY_ALLOW_PRIVATE_UPSTREAM" NTFY_URL="http://127.0.0.1:$FAKE_NTFY_PORT"
+expect_startup_error "NTFY_URL localhost rejected without ALLOW_PRIVATE_UPSTREAM" "MCP_NTFY_ALLOW_PRIVATE_UPSTREAM" NTFY_URL="http://localhost:$FAKE_NTFY_PORT"
 
 echo
 echo "== results: $PASS passed, $FAIL failed =="

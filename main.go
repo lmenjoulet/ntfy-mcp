@@ -153,6 +153,34 @@ func safeDialContext(dialer *net.Dialer, allowPrivate bool) func(ctx context.Con
 	}
 }
 
+// checkDefaultUpstreamAllowed reports an error when the default upstream
+// host is an IP, or resolves to an IP, that the dial guard would refuse.
+// A DNS lookup failure is not an error: the dial-time guard still applies
+// per request.
+func checkDefaultUpstreamAllowed(baseURL string) error {
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Hostname() == "" {
+		return nil
+	}
+	host := u.Hostname()
+	if ip := net.ParseIP(host); ip != nil {
+		if isBlockedUpstreamIP(ip) {
+			return fmt.Errorf("invalid NTFY_URL: %s is a private/loopback address but MCP_NTFY_ALLOW_PRIVATE_UPSTREAM is not set (set it to 1 for a LAN/localhost ntfy)", ip)
+		}
+		return nil
+	}
+	ips, err := net.DefaultResolver.LookupIPAddr(context.Background(), host)
+	if err != nil {
+		return nil
+	}
+	for _, a := range ips {
+		if isBlockedUpstreamIP(a.IP) {
+			return fmt.Errorf("invalid NTFY_URL: host %q resolves to %s, a private/loopback address, but MCP_NTFY_ALLOW_PRIVATE_UPSTREAM is not set (set it to 1 for a LAN/localhost ntfy)", host, a.IP)
+		}
+	}
+	return nil
+}
+
 // isBlockedUpstreamIP reports whether ip is off-limits as an upstream target.
 func isBlockedUpstreamIP(ip net.IP) bool {
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
@@ -340,37 +368,55 @@ func (c config) noteUpstreamStatus(baseURL string, status int) {
 func loadConfig() (config, error) {
 	var cfg config
 
-	mcpport, err := strconv.Atoi(getenv("MCP_NTFY_PORT", "12120"))
+	mcpport, err := getenvInt("MCP_NTFY_PORT", "12120")
 	if err != nil {
-		return cfg, fmt.Errorf("error getting MCP_NTFY_PORT environment variable: %w", err)
+		return cfg, err
+	}
+	if mcpport < 1 || mcpport > 65535 {
+		return cfg, fmt.Errorf("invalid MCP_NTFY_PORT: %d is not a valid port (1-65535)", mcpport)
 	}
 
-	maxFail, err := strconv.Atoi(getenv("MCP_NTFY_RATE_LIMIT_FAILURES", "5"))
+	maxFail, err := getenvInt("MCP_NTFY_RATE_LIMIT_FAILURES", "5")
 	if err != nil {
-		return cfg, fmt.Errorf("error getting MCP_NTFY_RATE_LIMIT_FAILURES environment variable: %w", err)
+		return cfg, err
 	}
-	windowSec, err := strconv.Atoi(getenv("MCP_NTFY_RATE_LIMIT_WINDOW", "60"))
-	if err != nil {
-		return cfg, fmt.Errorf("error getting MCP_NTFY_RATE_LIMIT_WINDOW environment variable: %w", err)
+	if maxFail < 0 {
+		return cfg, fmt.Errorf("invalid MCP_NTFY_RATE_LIMIT_FAILURES: %d (0 disables the guard, negative is invalid)", maxFail)
 	}
-	blockSec, err := strconv.Atoi(getenv("MCP_NTFY_RATE_LIMIT_BLOCK", "300"))
+	windowSec, err := getenvInt("MCP_NTFY_RATE_LIMIT_WINDOW", "60")
 	if err != nil {
-		return cfg, fmt.Errorf("error getting MCP_NTFY_RATE_LIMIT_BLOCK environment variable: %w", err)
+		return cfg, err
 	}
-	clientRateLimit, err := strconv.Atoi(getenv("MCP_NTFY_CLIENT_RATE_LIMIT", "120"))
-	if err != nil {
-		return cfg, fmt.Errorf("error getting MCP_NTFY_CLIENT_RATE_LIMIT environment variable: %w", err)
+	if windowSec <= 0 {
+		return cfg, fmt.Errorf("invalid MCP_NTFY_RATE_LIMIT_WINDOW: %d (must be > 0)", windowSec)
 	}
-	authFailLimit, err := strconv.Atoi(getenv("MCP_NTFY_AUTH_FAILURE_LIMIT", "10"))
+	blockSec, err := getenvInt("MCP_NTFY_RATE_LIMIT_BLOCK", "300")
 	if err != nil {
-		return cfg, fmt.Errorf("error getting MCP_NTFY_AUTH_FAILURE_LIMIT environment variable: %w", err)
+		return cfg, err
 	}
-	maxConcurrent, err := strconv.Atoi(getenv("MCP_NTFY_MAX_CONCURRENT_UPSTREAM", "32"))
+	if blockSec <= 0 {
+		return cfg, fmt.Errorf("invalid MCP_NTFY_RATE_LIMIT_BLOCK: %d (must be > 0)", blockSec)
+	}
+	clientRateLimit, err := getenvInt("MCP_NTFY_CLIENT_RATE_LIMIT", "120")
 	if err != nil {
-		return cfg, fmt.Errorf("error getting MCP_NTFY_MAX_CONCURRENT_UPSTREAM environment variable: %w", err)
+		return cfg, err
+	}
+	if clientRateLimit < 0 {
+		return cfg, fmt.Errorf("invalid MCP_NTFY_CLIENT_RATE_LIMIT: %d (0 disables the limit, negative is invalid)", clientRateLimit)
+	}
+	authFailLimit, err := getenvInt("MCP_NTFY_AUTH_FAILURE_LIMIT", "10")
+	if err != nil {
+		return cfg, err
+	}
+	if authFailLimit < 0 {
+		return cfg, fmt.Errorf("invalid MCP_NTFY_AUTH_FAILURE_LIMIT: %d (0 disables the limit, negative is invalid)", authFailLimit)
+	}
+	maxConcurrent, err := getenvInt("MCP_NTFY_MAX_CONCURRENT_UPSTREAM", "32")
+	if err != nil {
+		return cfg, err
 	}
 	if maxConcurrent <= 0 {
-		maxConcurrent = 32
+		return cfg, fmt.Errorf("invalid MCP_NTFY_MAX_CONCURRENT_UPSTREAM: %d (must be > 0)", maxConcurrent)
 	}
 	allowPrivate := isTruthy(getenv("MCP_NTFY_ALLOW_PRIVATE_UPSTREAM", "0"))
 
@@ -378,7 +424,10 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return cfg, fmt.Errorf("error getting MCP_NTFY_TRUSTED_PROXIES environment variable: %w", err)
 	}
-	allowedHosts := parseAllowedHosts(getenv("MCP_NTFY_ALLOWED_HOSTS", ""))
+	allowedHosts, err := parseAllowedHosts(getenv("MCP_NTFY_ALLOWED_HOSTS", ""))
+	if err != nil {
+		return cfg, fmt.Errorf("error getting MCP_NTFY_ALLOWED_HOSTS environment variable: %w", err)
+	}
 
 	transport := strings.ToLower(getenv("MCP_NTFY_TRANSPORT", "http"))
 	if transport != "http" && transport != "stdio" {
@@ -405,6 +454,24 @@ func loadConfig() (config, error) {
 
 	if err := validateBaseURL(cfg.BaseURL); err != nil {
 		return cfg, fmt.Errorf("invalid NTFY_URL: %w", err)
+	}
+	if !topicRe.MatchString(cfg.Topic) {
+		return cfg, fmt.Errorf("invalid NTFY_TOPIC %q: must be 1-64 chars of [A-Za-z0-9_-]", cfg.Topic)
+	}
+	if ip := net.ParseIP(strings.Trim(cfg.MCPAddr, "[]")); ip == nil && !hostnameRe.MatchString(cfg.MCPAddr) {
+		return cfg, fmt.Errorf("invalid MCP_NTFY_ADDR %q: not an IP address or hostname", cfg.MCPAddr)
+	}
+	if !allowPrivate {
+		if err := checkDefaultUpstreamAllowed(cfg.BaseURL); err != nil {
+			return cfg, err
+		}
+	}
+	for _, key := range []string{"MCP_NTFY_ALLOW_PRIVATE_UPSTREAM", "MCP_NTFY_UNSAFE_LOGS"} {
+		switch v := getenv(key, "0"); {
+		case v == "0" || v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "false"):
+		default:
+			log.Printf("WARNING: unrecognized %s=%q (want 0 or 1); treating it as false", key, v)
+		}
 	}
 
 	if transport == "stdio" && cfg.ClientToken != "" {
@@ -441,6 +508,7 @@ func loadConfig() (config, error) {
 			maxFail, windowSec, blockSec)
 	}
 
+	// TODO: also log when MCP_NTFY_CLIENT_TOKEN is empty (loopback case); never log the token itself.
 	if cfg.ClientToken != "" {
 		log.Print("MCP client authentication enabled: requests must carry the MCP_NTFY_CLIENT_TOKEN as a Bearer token")
 	}
@@ -456,6 +524,15 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// getenvInt parses an integer environment variable.
+func getenvInt(key, fallback string) (int, error) {
+	v, err := strconv.Atoi(getenv(key, fallback))
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return v, nil
 }
 
 func isTruthy(v string) bool {
@@ -490,7 +567,7 @@ func parseTrustedProxies(s string) ([]netip.Prefix, error) {
 
 // parseAllowedHosts parses a comma-separated list of Host values (with or
 // without port) into a set of lowercase hostnames. Empty input returns nil.
-func parseAllowedHosts(s string) map[string]bool {
+func parseAllowedHosts(s string) (map[string]bool, error) {
 	var out map[string]bool
 	for _, part := range strings.Split(s, ",") {
 		part = strings.TrimSpace(part)
@@ -501,16 +578,22 @@ func parseAllowedHosts(s string) map[string]bool {
 			part = host
 		}
 		part = strings.ToLower(strings.Trim(part, "[]"))
+		if net.ParseIP(part) == nil && !hostnameRe.MatchString(part) {
+			return nil, fmt.Errorf("invalid Host value %q: not an IP or hostname", part)
+		}
 		if out == nil {
 			out = map[string]bool{}
 		}
 		out[part] = true
 	}
-	return out
+	return out, nil
 }
 
 // topicRe is the charset ntfy accepts for a topic.
 var topicRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// hostnameRe matches a hostname (IPs are checked separately with net.ParseIP).
+var hostnameRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$`)
 
 // delayRe is the charset ntfy accepts in the Delay header (relative
 // durations like "30min" or absolute timestamps like "2025-12-31 18:00").
