@@ -461,6 +461,10 @@ func loadConfig() (config, error) {
 	if ip := net.ParseIP(strings.Trim(cfg.MCPAddr, "[]")); ip == nil && !hostnameRe.MatchString(cfg.MCPAddr) {
 		return cfg, fmt.Errorf("invalid MCP_NTFY_ADDR %q: not an IP address or hostname", cfg.MCPAddr)
 	}
+	// net.Listen needs an IPv6 literal in brackets ("[::1]:port").
+	if ip := net.ParseIP(strings.Trim(cfg.MCPAddr, "[]")); ip != nil && strings.Contains(cfg.MCPAddr, ":") && !strings.HasPrefix(cfg.MCPAddr, "[") {
+		cfg.MCPAddr = "[" + cfg.MCPAddr + "]"
+	}
 	if !allowPrivate {
 		if err := checkDefaultUpstreamAllowed(cfg.BaseURL); err != nil {
 			return cfg, err
@@ -714,11 +718,17 @@ func (l *rateLimiter) allow(key string) bool {
 // X-Forwarded-For entry when the direct peer is a trusted proxy (see
 // MCP_NTFY_TRUSTED_PROXIES) and that entry is a valid IP, otherwise the
 // direct peer IP.
-func clientIP(r *http.Request, trusted []netip.Prefix) string {
+// peerHost returns the IP part of the request's remote address.
+func peerHost(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		host = r.RemoteAddr
+		return r.RemoteAddr
 	}
+	return host
+}
+
+func clientIP(r *http.Request, trusted []netip.Prefix) string {
+	host := peerHost(r)
 	if addr, err := netip.ParseAddr(host); err == nil {
 		for _, p := range trusted {
 			if p.Contains(addr) {
@@ -736,9 +746,39 @@ func clientIP(r *http.Request, trusted []netip.Prefix) string {
 	return host
 }
 
+// trustedPeerWithoutXFF reports whether the request comes from a trusted
+// proxy but carries no usable X-Forwarded-For header, so rate limits fall
+// back to the proxy IP (one bucket shared by all clients behind it).
+func trustedPeerWithoutXFF(r *http.Request, trusted []netip.Prefix) bool {
+	if len(trusted) == 0 {
+		return false
+	}
+	addr, err := netip.ParseAddr(peerHost(r))
+	if err != nil {
+		return false
+	}
+	for _, p := range trusted {
+		if !p.Contains(addr) {
+			continue
+		}
+		xff := r.Header.Get("X-Forwarded-For")
+		if xff == "" {
+			return true
+		}
+		entries := strings.Split(xff, ",")
+		last := strings.TrimSpace(entries[len(entries)-1])
+		_, err = netip.ParseAddr(last)
+		return err != nil
+	}
+	return false
+}
+
 // withRateLimit answers 429 past the per-IP limit and caps the request body.
 func withRateLimit(limiter *rateLimiter, trusted []netip.Prefix, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if trustedPeerWithoutXFF(r, trusted) {
+			log.Printf("WARNING: request from trusted proxy %s without usable X-Forwarded-For: per-client rate limits use the proxy IP (all clients share one bucket)", peerHost(r))
+		}
 		if !limiter.allow(clientIP(r, trusted)) {
 			log.Printf("RATE LIMITED request from %s to %s %q: too many requests", r.RemoteAddr, r.Method, r.URL.Path)
 			http.Error(w, "too many requests, retry later", http.StatusTooManyRequests)

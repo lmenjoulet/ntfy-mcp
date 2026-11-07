@@ -15,7 +15,7 @@
 | `MCP_NTFY_CLIENT_RATE_LIMIT` | `120` | Max requests per client IP per window (`429` over); `0` disables |
 | `MCP_NTFY_AUTH_FAILURE_LIMIT` | `10` | Max failed authentications per IP per window (`429` over) |
 | `MCP_NTFY_MAX_CONCURRENT_UPSTREAM` | `32` | Max concurrent upstream calls |
-| `MCP_NTFY_TRUSTED_PROXIES` | *empty* | Comma-separated proxy IPs/CIDRs whose `X-Forwarded-For` is trusted for the per-client rate limits (set it behind a reverse proxy you control) |
+| `MCP_NTFY_TRUSTED_PROXIES` | *empty* | Comma-separated proxy IPs/CIDRs whose `X-Forwarded-For` is trusted for the per-client rate limits (set it behind a reverse proxy you control). Each `/mcp` request from a trusted proxy without a usable `X-Forwarded-For` logs a warning and shares the proxy's rate-limit bucket |
 | `MCP_NTFY_ALLOWED_HOSTS` | *empty* | Comma-separated public Host values accepted on `/mcp` when listening on loopback; use when a reverse proxy keeps the public Host. Prefer `proxy_set_header Host 127.0.0.1;` when you control the proxy |
 | `MCP_NTFY_ALLOW_PRIVATE_UPSTREAM` | `0` | `1` allows private/loopback upstream IPs (LAN-hosted ntfy only, never on an Internet-exposed endpoint) |
 | `MCP_NTFY_UNSAFE_LOGS` | `0` | `1` logs tokens in cleartext (debug only, never in production) |

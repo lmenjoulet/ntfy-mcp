@@ -27,6 +27,7 @@ MCP_GUARD_PORT="${MCP_GUARD_TEST_PORT:-12323}"
 MCP_PROXY_PORT="${MCP_PROXY_TEST_PORT:-12324}"
 MCP_SHUTDOWN_PORT="${MCP_SHUTDOWN_TEST_PORT:-12325}"
 MCP_HOSTS_PORT="${MCP_HOSTS_TEST_PORT:-12326}"
+MCP_V6_PORT="${MCP_V6_TEST_PORT:-12327}"
 FAKE_NTFY_URL="http://127.0.0.1:$FAKE_NTFY_PORT"
 export MCP_BASE_URL="http://127.0.0.1:$MCP_TEST_PORT/mcp"
 TEST_TOKEN="test-secret-token"
@@ -40,6 +41,7 @@ MCP_GUARD_PID=""
 MCP_PROXY_PID=""
 MCP_SHUTDOWN_PID=""
 MCP_HOSTS_PID=""
+MCP_V6_PID=""
 # Servers are started with setsid so cleanup can kill the whole process
 # group (e.g. "go run" and the compiled fake-ntfy it spawns).
 cleanup() {
@@ -49,6 +51,7 @@ cleanup() {
     [ -n "$MCP_PROXY_PID" ] && kill -- -"$MCP_PROXY_PID" 2>/dev/null || true
     [ -n "$MCP_SHUTDOWN_PID" ] && kill -- -"$MCP_SHUTDOWN_PID" 2>/dev/null || true
     [ -n "$MCP_HOSTS_PID" ] && kill -- -"$MCP_HOSTS_PID" 2>/dev/null || true
+    [ -n "$MCP_V6_PID" ] && kill -- -"$MCP_V6_PID" 2>/dev/null || true
     [ -n "$FAKE_PID" ] && kill -- -"$FAKE_PID" 2>/dev/null || true
     rm -rf "$TMP"
 }
@@ -61,9 +64,9 @@ port_in_use() {
     fi
     return 1
 }
-if port_in_use "$FAKE_NTFY_PORT" || port_in_use "$MCP_TEST_PORT" || port_in_use "$MCP_AUTH_PORT" || port_in_use "$MCP_GUARD_PORT" || port_in_use "$MCP_PROXY_PORT" || port_in_use "$MCP_SHUTDOWN_PORT" || port_in_use "$MCP_HOSTS_PORT"; then
-    echo "ERROR: port $FAKE_NTFY_PORT, $MCP_TEST_PORT, $MCP_AUTH_PORT, $MCP_GUARD_PORT, $MCP_PROXY_PORT, $MCP_SHUTDOWN_PORT or $MCP_HOSTS_PORT is already in use;" >&2
-    echo "set FAKE_NTFY_PORT / MCP_TEST_PORT / MCP_AUTH_TEST_PORT / MCP_GUARD_TEST_PORT / MCP_PROXY_TEST_PORT / MCP_SHUTDOWN_TEST_PORT / MCP_HOSTS_TEST_PORT to free ports" >&2
+if port_in_use "$FAKE_NTFY_PORT" || port_in_use "$MCP_TEST_PORT" || port_in_use "$MCP_AUTH_PORT" || port_in_use "$MCP_GUARD_PORT" || port_in_use "$MCP_PROXY_PORT" || port_in_use "$MCP_SHUTDOWN_PORT" || port_in_use "$MCP_HOSTS_PORT" || port_in_use "$MCP_V6_PORT"; then
+    echo "ERROR: port $FAKE_NTFY_PORT, $MCP_TEST_PORT, $MCP_AUTH_PORT, $MCP_GUARD_PORT, $MCP_PROXY_PORT, $MCP_SHUTDOWN_PORT, $MCP_HOSTS_PORT or $MCP_V6_PORT is already in use;" >&2
+    echo "set FAKE_NTFY_PORT / MCP_TEST_PORT / MCP_AUTH_TEST_PORT / MCP_GUARD_TEST_PORT / MCP_PROXY_TEST_PORT / MCP_SHUTDOWN_TEST_PORT / MCP_HOSTS_TEST_PORT / MCP_V6_TEST_PORT to free ports" >&2
     exit 1
 fi
 
@@ -503,6 +506,7 @@ if printf '%s' "$CODES" | grep -q '429'; then
 else
     ko "no X-Forwarded-For falls back to the peer IP and is throttled (got:$CODES)"
 fi
+assert_contains "no-XFF request from a trusted proxy logs a warning" "$(cat "$TMP/mcp-proxy.log")" "without usable X-Forwarded-For"
 
 # /healthz is outside the rate limit: the peer IP is throttled on /mcp but
 # probes still get 200.
@@ -625,11 +629,25 @@ expect_startup_error "invalid MCP_NTFY_ALLOWED_HOSTS entry rejected" "MCP_NTFY_A
 expect_startup_error "NTFY_URL private IP rejected without ALLOW_PRIVATE_UPSTREAM" "MCP_NTFY_ALLOW_PRIVATE_UPSTREAM" NTFY_URL="http://127.0.0.1:$FAKE_NTFY_PORT"
 expect_startup_error "NTFY_URL localhost rejected without ALLOW_PRIVATE_UPSTREAM" "MCP_NTFY_ALLOW_PRIVATE_UPSTREAM" NTFY_URL="http://localhost:$FAKE_NTFY_PORT"
 
+echo "== phase 9: IPv6 listen address (unbracketed literal is normalized) =="
+
+# MCP_NTFY_ADDR=::1 must be normalized to [::1] so net.Listen accepts it.
+setsid env NTFY_URL="$FAKE_NTFY_URL" NTFY_TOPIC="$TEST_TOPIC" NTFY_TOKEN="$TEST_TOKEN" \
+    MCP_NTFY_ADDR="::1" MCP_NTFY_PORT="$MCP_V6_PORT" MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1 \
+    "$TMP/ntfy-mcp" >"$TMP/mcp-v6.log" 2>&1 &
+MCP_V6_PID=$!
+wait_for_http "http://[::1]:$MCP_V6_PORT/healthz"
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://[::1]:$MCP_V6_PORT/healthz")"
+if [ "$code" = "200" ]; then ok "MCP_NTFY_ADDR=::1 serves /healthz on [::1]"; else ko "MCP_NTFY_ADDR=::1 serves /healthz on [::1] (got $code)"; fi
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST "http://[::1]:$MCP_V6_PORT/mcp" \
+    -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d "$INIT_BODY")"
+if [ "$code" = "200" ]; then ok "MCP initialize over [::1] -> HTTP 200"; else ko "MCP initialize over [::1] -> HTTP 200 (got $code)"; fi
+
 echo
 echo "== results: $PASS passed, $FAIL failed =="
 if [ "$FAIL" -gt 0 ]; then
     # Stop the test processes but keep the logs around for debugging.
-    kill -- -"$MCP_PID" -"$MCP_AUTH_PID" -"$MCP_GUARD_PID" -"$MCP_PROXY_PID" -"$FAKE_PID" 2>/dev/null || true
+    kill -- -"$MCP_PID" -"$MCP_AUTH_PID" -"$MCP_GUARD_PID" -"$MCP_PROXY_PID" -"$MCP_V6_PID" -"$FAKE_PID" 2>/dev/null || true
     trap - EXIT
     echo "Test logs kept at: $TMP (mcp.log, fake.log)" >&2
     exit 1
