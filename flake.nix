@@ -16,7 +16,7 @@
       packages = forEachSystem ({ pkgs }: {
   ntfy-mcp = pkgs.buildGoModule rec {
     pname = "ntfy-mcp";
-    version = "1.0.1";
+    version = "1.1.0";
     src = self;
     ldflags = [
       "-X main.Version=${version}"
@@ -56,6 +56,15 @@
       nixosModules.default = { config, pkgs, lib, ... }:
   let
     cfg = config.services.ntfy-mcp;
+    readIfPossible = f:
+      let e = builtins.tryEval (builtins.readFile f);
+      in if e.success then e.value else "";
+    envFiles = cfg.environmentFiles
+      ++ lib.optional (cfg.tokenFile != null) cfg.tokenFile
+      ++ lib.optional (cfg.clientTokenFile != null) cfg.clientTokenFile;
+    clientTokenProvided = lib.any
+      (f: lib.hasInfix "MCP_NTFY_CLIENT_TOKEN=" (readIfPossible f))
+      envFiles;
   in
   {
     options.services.ntfy-mcp = {
@@ -91,13 +100,27 @@
         description = "Topic ntfy par défaut.";
       };
 
+      environmentFiles = lib.mkOption {
+        type = lib.types.listOf lib.types.path;
+        default = [ ];
+        description = ''
+    Fichiers d'environnement (une ligne KEY=VALUE par secret) chargés par
+    le service systemd, ex. [ "/run/secrets/ntfy-mcp-token" ] pour
+    NTFY_TOKEN=... et [ "/run/secrets/ntfy-mcp-client-token" ] pour
+    MCP_NTFY_CLIENT_TOKEN=... (obligatoire quand le serveur écoute hors
+    loopback : toute requête MCP doit alors porter ce secret en en-tête
+    "Authorization: Bearer ..."). Préféré aux secrets en clair dans la
+    configuration.
+        '';
+      };
+
       tokenFile = lib.mkOption {
         type = lib.types.nullOr lib.types.path;
         default = null;
         description = ''
-    Fichier contenant le jeton d'accès ntfy, au format
-    NTFY_TOKEN=... (une ligne). Préféré à un jeton en clair
-    dans la configuration.
+    (Obsolète) Fichier contenant le jeton d'accès ntfy, au format
+    NTFY_TOKEN=... (une ligne). Remplacé par environmentFiles ; supprimé
+    dans une version x.x.0.
         '';
       };
 
@@ -105,13 +128,8 @@
         type = lib.types.nullOr lib.types.path;
         default = null;
         description = ''
-    Fichier contenant le secret partagé exigé des clients MCP, au format
-    MCP_NTFY_CLIENT_TOKEN=... (une ligne). Quand il est renseigné, toute
-    requête MCP doit porter ce secret en en-tête
-    "Authorization: Bearer ..." ; utile pour empêcher les utilisateurs
-    non authentifiés de spammer les notifications quand le serveur est
-    exposé au-delà de localhost. Préféré à un secret en clair dans la
-    configuration.
+    (Obsolète) Fichier contenant MCP_NTFY_CLIENT_TOKEN=... (une ligne).
+    Remplacé par environmentFiles ; supprimé dans une version x.x.0.
         '';
       };
 
@@ -156,9 +174,11 @@
 
     config = lib.mkIf cfg.enable {
       warnings =
-        lib.optional
-          (!(builtins.elem cfg.address [ "127.0.0.1" "::1" "localhost" ]) && cfg.clientTokenFile == null)
-          "ntfy-mcp: address is not loopback and clientTokenFile is not set: the MCP server will be reachable without client authentication; set clientTokenFile or expose it only behind an authenticated TLS reverse proxy.";
+        lib.optional (cfg.tokenFile != null || cfg.clientTokenFile != null)
+          "ntfy-mcp: services.ntfy-mcp.tokenFile and services.ntfy-mcp.clientTokenFile are deprecated; use services.ntfy-mcp.environmentFiles. The old options will be removed in a x.x.0 release."
+        ++ lib.optional
+          (!(builtins.elem cfg.address [ "127.0.0.1" "::1" "localhost" ]) && !clientTokenProvided)
+          "ntfy-mcp: address is not loopback and no environment file provides MCP_NTFY_CLIENT_TOKEN: the MCP server will be reachable without client authentication; add a MCP_NTFY_CLIENT_TOKEN=... file to environmentFiles or expose it only behind an authenticated TLS reverse proxy.";
 
       systemd.services.ntfy-mcp = {
         description = "Serveur MCP d'envoi de notifications ntfy";
@@ -177,9 +197,7 @@
     ++ lib.optional cfg.allowPrivateUpstream "MCP_NTFY_ALLOW_PRIVATE_UPSTREAM=1"
     ++ lib.optional (cfg.trustedProxies != [ ]) "MCP_NTFY_TRUSTED_PROXIES=${lib.concatStringsSep "," cfg.trustedProxies}"
     ++ lib.optional (cfg.allowedHosts != [ ]) "MCP_NTFY_ALLOWED_HOSTS=${lib.concatStringsSep "," cfg.allowedHosts}";
-    EnvironmentFile =
-      (lib.optional (cfg.tokenFile != null) cfg.tokenFile)
-      ++ (lib.optional (cfg.clientTokenFile != null) cfg.clientTokenFile);
+    EnvironmentFile = envFiles;
     DynamicUser = true;
     NoNewPrivileges = true;
     PrivateTmp = true;

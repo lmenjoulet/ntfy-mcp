@@ -9,6 +9,12 @@ nix develop --command go build ./...
 nix build          # full release build via the flake
 ```
 
+## NixOS module
+
+- When an option of `services.ntfy-mcp` is replaced or removed, keep the old
+  option as a deprecated alias (e.g. `lib.mkRenamedOptionModule`) and delete
+  it only in a major/minor release (version bump to x.x.0).
+
 ## Tests — mandatory before every commit
 
 ```bash
@@ -57,6 +63,12 @@ just Go on `PATH`):
   README short.
 - Document behavior, not its announcement: don't describe warnings or log
   messages the program prints — users observe those at runtime.
+- The same applies to every file under `docs/`: usage only, never the code
+  or its internals, no argumentation, as concise as possible.
+- No `TODO` section in the README or any doc: keep TODOs inline as
+  `TODO: ...` markers (in Markdown, an HTML comment `<!-- TODO: ... -->` so
+  it stays invisible when rendered) so they can be grepped at any time with
+  `grep -rn TODO`.
 - Code comments state what the code does, as concisely and plainly as
   possible. They must never justify, defend or argue for the code or its
   design choices — no rationale, no "so that…", no security-reasoning
@@ -95,3 +107,7 @@ just Go on `PATH`):
   `%q`, never `%s`: decoded values can contain newlines and forge extra
   log lines.
 - Test scripts must not contain real secrets.
+- Before pushing a security measure, evaluate its production risks: if it
+  blocks an identified use case (e.g. a reverse proxy that keeps the public
+  Host header), it must ship with a documented escape hatch
+  (precedent: `MCP_NTFY_ALLOWED_HOSTS`).
