@@ -512,9 +512,10 @@ func loadConfig() (config, error) {
 			maxFail, windowSec, blockSec)
 	}
 
-	// TODO: also log when MCP_NTFY_CLIENT_TOKEN is empty (loopback case); never log the token itself.
 	if cfg.ClientToken != "" {
 		log.Print("MCP client authentication enabled: requests must carry the MCP_NTFY_CLIENT_TOKEN as a Bearer token")
+	} else if transport == "http" && isLoopbackAddr(cfg.MCPAddr) {
+		log.Print("MCP client authentication disabled (MCP_NTFY_CLIENT_TOKEN is empty)")
 	}
 	if cfg.UnsafeLogs == "1" {
 		log.Print("WARNING: MCP_NTFY_UNSAFE_LOGS=1, tokens will appear in cleartext in the logs")

@@ -14,6 +14,8 @@ nix build          # full release build via the flake
 - When an option of `services.ntfy-mcp` is replaced or removed, keep the old
   option as a deprecated alias (e.g. `lib.mkRenamedOptionModule`) and delete
   it only in a major/minor release (version bump to x.x.0).
+- Never document a deprecated option: remove it from `docs/` as soon as it is
+  deprecated (the alias itself stays in the module until the x.x.0 release).
 
 ## Tests — mandatory before every commit
 
